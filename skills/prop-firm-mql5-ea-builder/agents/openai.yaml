@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prop Firm MQL5 EA Builder"
+  short_description: "Build robust XAUUSD MQL5 EAs for prop-firm limits."
+  default_prompt: "Use $prop-firm-mql5-ea-builder to generate a production-ready modular XAUUSD EA with strict prop-firm risk and execution controls."
