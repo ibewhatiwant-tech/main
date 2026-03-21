@@ -2,7 +2,8 @@
 //| CopyTrading/SignalBroadcaster.mqh                                |
 //| Broadcasts trade signals to followers via file system            |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_SIGNALBROADCASTER_MQH
+#define COPYTRADING_SIGNALBROADCASTER_MQH
 #include "Defines.mqh"
 #include "Logger.mqh"
 #include "Signal.mqh"
@@ -358,3 +359,4 @@ void CSignalBroadcaster::ProcessRetryQueue()
      }
   }
 //+------------------------------------------------------------------+
+#endif // COPYTRADING_SIGNALBROADCASTER_MQH

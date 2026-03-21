@@ -2,7 +2,8 @@
 //| CopyTrading/TradeMonitor.mqh                                     |
 //| Monitors master account positions and detects trade events       |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_TRADEMONITOR_MQH
+#define COPYTRADING_TRADEMONITOR_MQH
 #include "Defines.mqh"
 #include "Logger.mqh"
 #include "Signal.mqh"
@@ -589,3 +590,4 @@ bool CTradeMonitor::IsDirectionAllowed(ENUM_ORDER_TYPE orderType) const
          return true;
      }
   }
+#endif // COPYTRADING_TRADEMONITOR_MQH

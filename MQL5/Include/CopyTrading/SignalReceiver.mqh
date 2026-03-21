@@ -2,7 +2,8 @@
 //| CopyTrading/SignalReceiver.mqh                                   |
 //| Receives trade signals from master via file system polling       |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_SIGNALRECEIVER_MQH
+#define COPYTRADING_SIGNALRECEIVER_MQH
 #include "Defines.mqh"
 #include "Logger.mqh"
 #include "Signal.mqh"
@@ -497,3 +498,4 @@ string CSignalReceiver::ExtractSignalId(const string &filename) const
    return StringSubstr(withoutExt, lastUnderscore + 1);
   }
 //+------------------------------------------------------------------+
+#endif // COPYTRADING_SIGNALRECEIVER_MQH

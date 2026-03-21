@@ -2,7 +2,8 @@
 //| CopyTrading/MT5Wrapper.mqh                                       |
 //| MT5 API wrapper with retry logic and error handling              |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_MT5WRAPPER_MQH
+#define COPYTRADING_MT5WRAPPER_MQH
 #include "Defines.mqh"
 #include "Logger.mqh"
 
@@ -693,3 +694,4 @@ double CMT5Wrapper::GetPipValue(string symbol)
 
    return (tickValue / tickSize) * point * 10.0;
   }
+#endif // COPYTRADING_MT5WRAPPER_MQH

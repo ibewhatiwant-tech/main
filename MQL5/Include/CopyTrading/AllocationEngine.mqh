@@ -2,7 +2,8 @@
 //| CopyTrading/AllocationEngine.mqh                                 |
 //| Calculates follower lot sizes using 4 allocation methods         |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_ALLOCATIONENGINE_MQH
+#define COPYTRADING_ALLOCATIONENGINE_MQH
 #include "Defines.mqh"
 #include "Logger.mqh"
 #include "Signal.mqh"
@@ -468,3 +469,4 @@ double CAllocationEngine::CalculateEquityBased(const CSignal &signal)
 
    return CapAndNormalize(signal.symbol, lots, "CalculateEquityBased");
   }
+#endif // COPYTRADING_ALLOCATIONENGINE_MQH

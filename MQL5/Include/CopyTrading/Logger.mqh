@@ -2,7 +2,8 @@
 //| CopyTrading/Logger.mqh                                           |
 //| Structured leveled logging system                                |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_LOGGER_MQH
+#define COPYTRADING_LOGGER_MQH
 #include "Defines.mqh"
 
 class CLogger
@@ -307,3 +308,4 @@ void CLogger::SetMinLevel(ENUM_LOG_LEVEL level)
   {
    m_minLevel = level;
   }
+#endif // COPYTRADING_LOGGER_MQH

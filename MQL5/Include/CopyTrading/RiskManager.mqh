@@ -2,7 +2,8 @@
 //| CopyTrading/RiskManager.mqh                                      |
 //| Risk management and trade validation                             |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_RISKMANAGER_MQH
+#define COPYTRADING_RISKMANAGER_MQH
 #include "Defines.mqh"
 #include "Logger.mqh"
 #include "Signal.mqh"
@@ -673,3 +674,4 @@ void CRiskManager::CloseAllPositions()
         }
      }
   }
+#endif // COPYTRADING_RISKMANAGER_MQH

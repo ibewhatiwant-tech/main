@@ -2,7 +2,8 @@
 //| CopyTrading/Dashboard.mqh                                        |
 //| On-chart graphical dashboard display                             |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_DASHBOARD_MQH
+#define COPYTRADING_DASHBOARD_MQH
 #include "Defines.mqh"
 #include "PerformanceTracker.mqh"
 
@@ -559,3 +560,4 @@ string CDashboard::BoolToStatus(bool b, string trueStr, string falseStr) const
   {
    return b ? trueStr : falseStr;
   }
+#endif // COPYTRADING_DASHBOARD_MQH

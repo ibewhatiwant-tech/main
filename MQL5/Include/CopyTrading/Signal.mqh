@@ -2,7 +2,8 @@
 //| CopyTrading/Signal.mqh                                           |
 //| Trade signal data structure with JSON serialization              |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_SIGNAL_MQH
+#define COPYTRADING_SIGNAL_MQH
 #include "Defines.mqh"
 
 class CSignal
@@ -389,3 +390,4 @@ string CSignal::GenerateUUID(long accountId)
      }
    return hex;
   }
+#endif // COPYTRADING_SIGNAL_MQH

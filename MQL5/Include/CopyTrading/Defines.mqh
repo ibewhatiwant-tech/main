@@ -3,7 +3,8 @@
 //| Shared constants, enums, and data structures for the             |
 //| Copy Trading System for MetaTrader 5                             |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_DEFINES_MQH
+#define COPYTRADING_DEFINES_MQH
 
 //--- Signal type enumeration
 enum ENUM_SIGNAL_TYPE
@@ -131,3 +132,4 @@ struct SDailyStats
 #define CT_STATE_PREFIX         "state_"
 #define CT_POSMAP_PREFIX        "posmap_"
 #define CT_STATS_PREFIX         "stats_"
+#endif // COPYTRADING_DEFINES_MQH

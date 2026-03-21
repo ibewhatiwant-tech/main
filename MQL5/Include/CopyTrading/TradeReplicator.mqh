@@ -2,7 +2,8 @@
 //| CopyTrading/TradeReplicator.mqh                                  |
 //| Executes trade replications on the follower account              |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_TRADEREPLICATOR_MQH
+#define COPYTRADING_TRADEREPLICATOR_MQH
 #include "Defines.mqh"
 #include "Logger.mqh"
 #include "Signal.mqh"
@@ -1023,3 +1024,4 @@ bool CTradeReplicator::IsBuyType(ENUM_ORDER_TYPE t)
            t == ORDER_TYPE_BUY_STOP       ||
            t == ORDER_TYPE_BUY_STOP_LIMIT);
   }
+#endif // COPYTRADING_TRADEREPLICATOR_MQH

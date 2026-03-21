@@ -2,7 +2,8 @@
 //| CopyTrading/PerformanceTracker.mqh                               |
 //| Performance metrics and statistics tracking                      |
 //+------------------------------------------------------------------+
-#pragma once
+#ifndef COPYTRADING_PERFORMANCETRACKER_MQH
+#define COPYTRADING_PERFORMANCETRACKER_MQH
 #include "Defines.mqh"
 #include "Logger.mqh"
 
@@ -560,3 +561,4 @@ string CPerformanceTracker::DoubleToStr2(double value) const
   {
    return DoubleToString(value, 2);
   }
+#endif // COPYTRADING_PERFORMANCETRACKER_MQH
