@@ -105,7 +105,6 @@ CDashboard::CDashboard()
    m_labelCount    = 0;
    m_chartSymbol   = "";
    m_chartId       = 0;
-   ArrayInitialize(m_labels, "");
   }
 
 //+------------------------------------------------------------------+
@@ -147,7 +146,6 @@ bool CDashboard::Init(bool isMaster, int corner = 1, int fontSize = 9)
    m_colorWarning  = clrYellow;
    m_colorHeader   = clrCyan;
 
-   ArrayResize(m_labels, 50);
    m_labelCount = 0;
    m_visible    = true;
 
@@ -337,9 +335,9 @@ void CDashboard::UpdateMaster(string signalName,
 
    // Row 2: broadcast status
    if(broadcasting)
-      SetLabelText(LabelName(2), "Status  : \u25CF BROADCASTING", m_colorPositive);
+      SetLabelText(LabelName(2), "Status  : * BROADCASTING", m_colorPositive);
    else
-      SetLabelText(LabelName(2), "Status  : \u25CB STOPPED", m_colorNegative);
+      SetLabelText(LabelName(2), "Status  : o STOPPED", m_colorNegative);
 
    // Row 3: separator — static
 
@@ -413,17 +411,17 @@ void CDashboard::UpdateFollower(string masterName,
    color  connClr;
    if(connected && copyingActive)
      {
-      connStr = "Conn    : \u25CF Connected";
+      connStr = "Conn    : * Connected";
       connClr = m_colorPositive;
      }
    else if(connected && !copyingActive)
      {
-      connStr = "Conn    : \u007E Degraded";
+      connStr = "Conn    : ~ Degraded";
       connClr = m_colorWarning;
      }
    else
      {
-      connStr = "Conn    : \u25CB Disconnected";
+      connStr = "Conn    : o Disconnected";
       connClr = m_colorNegative;
      }
    SetLabelText(LabelName(2), connStr, connClr);
