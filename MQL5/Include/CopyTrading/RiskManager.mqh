@@ -57,7 +57,7 @@ public:
                           bool     closeOnDrawdown);
 
    //--- Core validation — called before every order send
-   bool              ValidateTrade(const CSignal &signal, double lotSize);
+   bool              ValidateTrade(CSignal &signal, double lotSize);
 
    //--- Called on every EA OnTick() to maintain continuous monitoring
    void              OnTick();
@@ -166,7 +166,7 @@ bool CRiskManager::Init(CLogger *logger,
 //+------------------------------------------------------------------+
 //| ValidateTrade — gate every outbound order through all checks     |
 //+------------------------------------------------------------------+
-bool CRiskManager::ValidateTrade(const CSignal &signal, double lotSize)
+bool CRiskManager::ValidateTrade(CSignal &signal, double lotSize)
   {
    // Close and modify signals always pass — we must never block them
    if(signal.type == SIGNAL_CLOSE || signal.type == SIGNAL_CLOSE_PARTIAL)
@@ -229,9 +229,7 @@ bool CRiskManager::ValidateTrade(const CSignal &signal, double lotSize)
      }
 
    // --- 6. Stop-loss policy check (may mutate signal.stopLoss) ---
-   // Cast away const so EnforceSLPolicy can apply an emergency SL
-   CSignal &mutableSignal = const_cast<CSignal &>(signal);
-   if(!EnforceSLPolicy(mutableSignal))
+   if(!EnforceSLPolicy(signal))
      {
       m_logger.Warn("ValidateTrade: SL policy check failed — trade blocked",
                     "symbol=" + signal.symbol);
