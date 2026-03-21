@@ -69,8 +69,8 @@ public:
    void              ProcessSignal(const CSignal &signal);
 
    //--- Signal-type handlers
-   bool              ReplicateMarketOrder(const CSignal &signal);
-   bool              ReplicatePendingOrder(const CSignal &signal);
+   bool              ReplicateMarketOrder(CSignal &signal);
+   bool              ReplicatePendingOrder(CSignal &signal);
    bool              ReplicateModification(const CSignal &signal);
    bool              ReplicateClosure(const CSignal &signal);
    bool              ReplicatePartialClosure(const CSignal &signal);
@@ -266,7 +266,7 @@ void CTradeReplicator::ProcessSignal(const CSignal &signal)
 //+------------------------------------------------------------------+
 //| ReplicateMarketOrder — open a matching market order              |
 //+------------------------------------------------------------------+
-bool CTradeReplicator::ReplicateMarketOrder(const CSignal &signal)
+bool CTradeReplicator::ReplicateMarketOrder(CSignal &signal)
   {
    // Symbol availability check
    if(!m_mt5.CheckSymbolExists(signal.symbol))
@@ -358,7 +358,7 @@ bool CTradeReplicator::ReplicateMarketOrder(const CSignal &signal)
 //+------------------------------------------------------------------+
 //| ReplicatePendingOrder — place a matching pending order           |
 //+------------------------------------------------------------------+
-bool CTradeReplicator::ReplicatePendingOrder(const CSignal &signal)
+bool CTradeReplicator::ReplicatePendingOrder(CSignal &signal)
   {
    // Symbol availability check
    if(!m_mt5.CheckSymbolExists(signal.symbol))
