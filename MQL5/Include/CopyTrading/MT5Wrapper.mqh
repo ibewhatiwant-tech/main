@@ -516,7 +516,7 @@ bool CMT5Wrapper::IsRetriableError(uint retcode)
       case TRADE_RETCODE_CONNECTION:    // 10005 — no connection to trade server
       case TRADE_RETCODE_PRICE_CHANGED: // 10006 — price changed
       case TRADE_RETCODE_TIMEOUT:       // 10010 — request processing timeout
-      case TRADE_RETCODE_OFF_QUOTES:    // 10021 — no quotes / market closed
+      case TRADE_RETCODE_PRICE_OFF:     // 10021 — no quotes / market closed
       case TRADE_RETCODE_ERROR:         // 10022 — common error (internal)
          return true;
 
@@ -541,7 +541,7 @@ string CMT5Wrapper::RetcodeToString(uint retcode)
       case TRADE_RETCODE_CONNECTION:        return "No connection to trade server (CONNECTION)";
       case TRADE_RETCODE_PRICE_CHANGED:     return "Price changed (PRICE_CHANGED)";
       case TRADE_RETCODE_PRICE_OFF:         return "No quotes for the request (PRICE_OFF)";
-      case TRADE_RETCODE_INVALID_EXPIRE:    return "Invalid order expiration (INVALID_EXPIRE)";
+      case TRADE_RETCODE_INVALID_EXPIRATION:return "Invalid order expiration (INVALID_EXPIRATION)";
       case TRADE_RETCODE_ORDER_CHANGED:     return "Order state changed (ORDER_CHANGED)";
       case TRADE_RETCODE_TOO_MANY_REQUESTS: return "Too many requests (TOO_MANY_REQUESTS)";
       case TRADE_RETCODE_NO_CHANGES:        return "No changes in the request (NO_CHANGES)";
@@ -550,14 +550,12 @@ string CMT5Wrapper::RetcodeToString(uint retcode)
       case TRADE_RETCODE_LOCKED:            return "Request locked for processing (LOCKED)";
       case TRADE_RETCODE_FROZEN:            return "Order/position frozen (FROZEN)";
       case TRADE_RETCODE_INVALID_FILL:      return "Invalid filling type (INVALID_FILL)";
-      case TRADE_RETCODE_CONNECTION_FAILED: return "Connection failed (CONNECTION_FAILED)";
       case TRADE_RETCODE_ONLY_REAL:         return "Real account required (ONLY_REAL)";
       case TRADE_RETCODE_LIMIT_ORDERS:      return "Pending orders limit reached (LIMIT_ORDERS)";
       case TRADE_RETCODE_LIMIT_VOLUME:      return "Volume limit reached (LIMIT_VOLUME)";
       case TRADE_RETCODE_INVALID_ORDER:     return "Invalid or prohibited order type (INVALID_ORDER)";
       case TRADE_RETCODE_POSITION_CLOSED:   return "Position already closed (POSITION_CLOSED)";
       case TRADE_RETCODE_TIMEOUT:           return "Request timed out (TIMEOUT)";
-      case TRADE_RETCODE_OFF_QUOTES:        return "No quotes / market closed (OFF_QUOTES)";
       case TRADE_RETCODE_ERROR:             return "Common internal error (ERROR)";
       case TRADE_RETCODE_NO_MONEY:          return "Insufficient funds (NO_MONEY)";
       case TRADE_RETCODE_INVALID_STOPS:     return "Invalid stop levels (INVALID_STOPS)";
