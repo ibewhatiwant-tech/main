@@ -29,15 +29,15 @@ private:
 public:
                      CLogger();
                     ~CLogger();
-   bool              Init(const string &component, ENUM_LOG_LEVEL minLevel=LOG_INFO);
+   bool              Init(string component, ENUM_LOG_LEVEL minLevel=LOG_INFO);
    void              Deinit();
-   void              Log(ENUM_LOG_LEVEL level, const string &message, const string &context="");
-   void              Trace(const string &msg, const string &ctx="");
-   void              Debug(const string &msg, const string &ctx="");
-   void              Info(const string &msg, const string &ctx="");
-   void              Warn(const string &msg, const string &ctx="");
-   void              Error(const string &msg, const string &ctx="");
-   void              Fatal(const string &msg, const string &ctx="");
+   void              Log(ENUM_LOG_LEVEL level, string message, string context="");
+   void              Trace(string msg, string ctx="");
+   void              Debug(string msg, string ctx="");
+   void              Info(string msg, string ctx="");
+   void              Warn(string msg, string ctx="");
+   void              Error(string msg, string ctx="");
+   void              Fatal(string msg, string ctx="");
    void              SetMinLevel(ENUM_LOG_LEVEL level);
    ENUM_LOG_LEVEL    GetMinLevel() const { return m_minLevel; }
   };
@@ -121,7 +121,7 @@ void CLogger::OpenLogFile()
      {
       // Seek to end to append
       FileSeek(m_fileHandle, 0, SEEK_END);
-      m_fileSizeBytes = FileTell(m_fileHandle);
+      m_fileSizeBytes = (long)FileTell(m_fileHandle);
      }
    else
      {
@@ -194,7 +194,7 @@ void CLogger::WriteToFile(const string &line)
 //+------------------------------------------------------------------+
 //| Initialise the logger                                            |
 //+------------------------------------------------------------------+
-bool CLogger::Init(const string &component, ENUM_LOG_LEVEL minLevel=LOG_INFO)
+bool CLogger::Init(string component, ENUM_LOG_LEVEL minLevel=LOG_INFO)
   {
    if(m_initialized)
       Deinit();
@@ -240,7 +240,7 @@ void CLogger::Deinit()
 //+------------------------------------------------------------------+
 //| Core log method                                                  |
 //+------------------------------------------------------------------+
-void CLogger::Log(ENUM_LOG_LEVEL level, const string &message, const string &context="")
+void CLogger::Log(ENUM_LOG_LEVEL level, string message, string context="")
   {
    if(level < m_minLevel)
       return;
@@ -271,32 +271,32 @@ void CLogger::Log(ENUM_LOG_LEVEL level, const string &message, const string &con
 //+------------------------------------------------------------------+
 //| Convenience wrappers                                             |
 //+------------------------------------------------------------------+
-void CLogger::Trace(const string &msg, const string &ctx="")
+void CLogger::Trace(string msg, string ctx="")
   {
    Log(LOG_TRACE, msg, ctx);
   }
 
-void CLogger::Debug(const string &msg, const string &ctx="")
+void CLogger::Debug(string msg, string ctx="")
   {
    Log(LOG_DEBUG, msg, ctx);
   }
 
-void CLogger::Info(const string &msg, const string &ctx="")
+void CLogger::Info(string msg, string ctx="")
   {
    Log(LOG_INFO, msg, ctx);
   }
 
-void CLogger::Warn(const string &msg, const string &ctx="")
+void CLogger::Warn(string msg, string ctx="")
   {
    Log(LOG_WARN, msg, ctx);
   }
 
-void CLogger::Error(const string &msg, const string &ctx="")
+void CLogger::Error(string msg, string ctx="")
   {
    Log(LOG_ERROR, msg, ctx);
   }
 
-void CLogger::Fatal(const string &msg, const string &ctx="")
+void CLogger::Fatal(string msg, string ctx="")
   {
    Log(LOG_FATAL, msg, ctx);
   }
