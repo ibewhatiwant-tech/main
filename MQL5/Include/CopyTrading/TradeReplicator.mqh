@@ -349,11 +349,11 @@ bool CTradeReplicator::ReplicateMarketOrder(CSignal &signal)
                     " price="          + DoubleToString(price, 5) +
                     " sl="             + DoubleToString(followerSL, 5) +
                     " tp="             + DoubleToString(followerTP, 5));
-      double pt = SymbolInfoDouble(signal.symbol, SYMBOL_POINT);
-      double slippage = (signal.price > 0.0 && pt > 0.0)
-                        ? MathAbs(price - signal.price) / pt / 10.0
-                        : 0.0;
-      if(m_perf != NULL) m_perf.RecordTradeCopied(slippage);
+      if(m_perf != NULL)
+         m_perf.RecordTradeCopied(
+            (signal.price > 0.0 && SymbolInfoDouble(signal.symbol, SYMBOL_POINT) > 0.0)
+            ? MathAbs(price - signal.price) / SymbolInfoDouble(signal.symbol, SYMBOL_POINT) / 10.0
+            : 0.0);
      }
    else
      {
