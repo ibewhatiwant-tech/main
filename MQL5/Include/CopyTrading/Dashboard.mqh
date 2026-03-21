@@ -365,24 +365,9 @@ void CDashboard::UpdateMaster(string signalName,
    SetLabelText(LabelName(8), "Open Pos  : " + IntegerToString(openPositions),
                 m_colorNormal);
 
-   // Row 9: copy success rate (copied vs copied+failed)
-   string successStr = "---";
-   color  successClr = m_colorNormal;
-   if(perf != NULL)
-     {
-      int copied = perf.GetTradesCopied();
-      int failed = perf.GetTradesFailed();
-      int total  = copied + failed;
-      if(total > 0)
-        {
-         double rate = (double)copied / (double)total * 100.0;
-         successStr = DoubleToString(rate, 1) + "% (" +
-                      IntegerToString(copied) + "/" + IntegerToString(total) + ")";
-         successClr = (rate >= 90.0) ? m_colorPositive :
-                      (rate >= 70.0) ? m_colorWarning  : m_colorNegative;
-        }
-     }
-   SetLabelText(LabelName(9), "Success   : " + successStr, successClr);
+   // Row 9: total trades (all-time closed)
+   int totalTrades = (perf != NULL) ? perf.GetTotalTrades() : 0;
+   SetLabelText(LabelName(9), "Total Trd : " + IntegerToString(totalTrades), m_colorNormal);
 
    ChartRedraw();
   }

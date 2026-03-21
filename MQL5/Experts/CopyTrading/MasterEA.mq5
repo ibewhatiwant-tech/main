@@ -64,6 +64,8 @@ bool               g_initialized  = false;
 datetime           g_lastTimerRun = 0;
 int                g_timerCounter = 0;
 bool               g_broadcastEnabled = true;
+ulong              g_lastProcessedTicket = 0;  // last deal ticket fed to PerformanceTracker
+datetime           g_historyFrom         = 0;  // session start — only scan deals from here
 
 //+------------------------------------------------------------------+
 //| Expert Advisor Initialization                                     |
@@ -143,6 +145,9 @@ int OnInit()
       g_logger.Warn("Failed to set timer — periodic tasks may not run");
      }
 
+   //--- Record session start for deal history scanning
+   g_historyFrom = TimeCurrent();
+
    g_initialized = true;
    g_logger.Info("MasterEA fully initialized. Signal ID: " + g_masterId);
    g_logger.Info("Signal Name: " + InpSignalName);
@@ -187,6 +192,9 @@ void OnTrade()
 
    //--- Let trade monitor detect changes
    g_monitor.OnTrade();
+
+   //--- Scan deal history for newly closed positions and update performance metrics
+   ScanClosedDeals();
 
    //--- Process all detected signals
    CSignal signal;
@@ -273,6 +281,38 @@ void UpdateDashboard()
       openPositions,
       &g_perfTracker
    );
+  }
+
+//+------------------------------------------------------------------+
+//| Scan deal history for newly closed trades; feed PerformanceTracker|
+//+------------------------------------------------------------------+
+void ScanClosedDeals()
+  {
+   if(!HistorySelect(g_historyFrom, TimeCurrent()))
+      return;
+
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0 || ticket <= g_lastProcessedTicket)
+         continue;
+
+      //--- Only interested in position-closing deals
+      if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+        {
+         g_lastProcessedTicket = ticket;   // advance marker even for non-close deals
+         continue;
+        }
+
+      datetime dealTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      double   profit   = HistoryDealGetDouble(ticket, DEAL_PROFIT)
+                        + HistoryDealGetDouble(ticket, DEAL_SWAP)
+                        + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+
+      g_perfTracker.OnTradeClose(profit, dealTime);
+      g_lastProcessedTicket = ticket;
+     }
   }
 
 //+------------------------------------------------------------------+
