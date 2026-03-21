@@ -66,7 +66,7 @@ public:
                           int                slippage    = CT_MAX_SLIPPAGE);
 
    //--- Primary entry point
-   void              ProcessSignal(const CSignal &signal);
+   void              ProcessSignal(CSignal &signal);
 
    //--- Signal-type handlers
    bool              ReplicateMarketOrder(CSignal &signal);
@@ -203,7 +203,7 @@ bool CTradeReplicator::Init(CLogger          *logger,
 //+------------------------------------------------------------------+
 //| ProcessSignal — dispatch incoming signal to the correct handler  |
 //+------------------------------------------------------------------+
-void CTradeReplicator::ProcessSignal(const CSignal &signal)
+void CTradeReplicator::ProcessSignal(CSignal &signal)
   {
    m_logger.Info("Processing signal: " + signal.signalId +
                  " type=" + IntegerToString((int)signal.type),
