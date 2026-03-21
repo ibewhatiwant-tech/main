@@ -170,6 +170,7 @@ int OnInit()
 
    //--- Initialize trade replicator
    if(!g_replicator.Init(&g_logger, &g_mt5, &g_allocEngine, &g_riskMgr,
+                          &g_perfTracker,
                           g_followerId, CT_MAGIC_NUMBER, CT_MAX_SLIPPAGE))
      {
       g_logger.Fatal("Failed to initialize TradeReplicator");

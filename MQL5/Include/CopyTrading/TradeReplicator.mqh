@@ -10,6 +10,7 @@
 #include "MT5Wrapper.mqh"
 #include "AllocationEngine.mqh"
 #include "RiskManager.mqh"
+#include "PerformanceTracker.mqh"
 
 //+------------------------------------------------------------------+
 //| CTradeReplicator                                                 |
@@ -27,10 +28,11 @@ private:
    int               m_positionMapCount;       // Number of live entries
 
    //--- External dependencies (owned by the caller — never deleted here)
-   CMT5Wrapper      *m_mt5;
-   CAllocationEngine *m_allocEngine;
-   CRiskManager     *m_riskMgr;
-   CLogger          *m_logger;
+   CMT5Wrapper          *m_mt5;
+   CAllocationEngine    *m_allocEngine;
+   CRiskManager         *m_riskMgr;
+   CLogger              *m_logger;
+   CPerformanceTracker  *m_perf;
 
    //--- Configuration
    string            m_followerId;
@@ -57,13 +59,14 @@ public:
                     ~CTradeReplicator();
 
    //--- Lifecycle
-   bool              Init(CLogger          *logger,
-                          CMT5Wrapper       *mt5,
-                          CAllocationEngine *alloc,
-                          CRiskManager      *risk,
-                          string             followerId,
-                          int                magicNumber = CT_MAGIC_NUMBER,
-                          int                slippage    = CT_MAX_SLIPPAGE);
+   bool              Init(CLogger             *logger,
+                          CMT5Wrapper          *mt5,
+                          CAllocationEngine    *alloc,
+                          CRiskManager         *risk,
+                          CPerformanceTracker  *perf,
+                          string                followerId,
+                          int                   magicNumber = CT_MAGIC_NUMBER,
+                          int                   slippage    = CT_MAX_SLIPPAGE);
 
    //--- Primary entry point
    void              ProcessSignal(CSignal &signal);
@@ -115,6 +118,7 @@ CTradeReplicator::CTradeReplicator()
    m_allocEngine        = NULL;
    m_riskMgr            = NULL;
    m_logger             = NULL;
+   m_perf               = NULL;
    m_followerId         = "";
    m_magicNumber        = CT_MAGIC_NUMBER;
    m_slippage           = CT_MAX_SLIPPAGE;
@@ -138,13 +142,14 @@ CTradeReplicator::~CTradeReplicator()
 //+------------------------------------------------------------------+
 //| Init — wire up dependencies and restore persisted map            |
 //+------------------------------------------------------------------+
-bool CTradeReplicator::Init(CLogger          *logger,
-                             CMT5Wrapper       *mt5,
-                             CAllocationEngine *alloc,
-                             CRiskManager      *risk,
-                             string             followerId,
-                             int                magicNumber = CT_MAGIC_NUMBER,
-                             int                slippage    = CT_MAX_SLIPPAGE)
+bool CTradeReplicator::Init(CLogger              *logger,
+                             CMT5Wrapper           *mt5,
+                             CAllocationEngine     *alloc,
+                             CRiskManager          *risk,
+                             CPerformanceTracker   *perf,
+                             string                 followerId,
+                             int                    magicNumber = CT_MAGIC_NUMBER,
+                             int                    slippage    = CT_MAX_SLIPPAGE)
   {
    if(logger == NULL)
      {
@@ -176,6 +181,7 @@ bool CTradeReplicator::Init(CLogger          *logger,
    m_mt5          = mt5;
    m_allocEngine  = alloc;
    m_riskMgr      = risk;
+   m_perf         = perf;    // may be NULL — all calls guarded with != NULL check
    m_followerId   = followerId;
    m_magicNumber  = (magicNumber > 0) ? magicNumber : CT_MAGIC_NUMBER;
    m_slippage     = (slippage    > 0) ? slippage    : CT_MAX_SLIPPAGE;
@@ -343,6 +349,7 @@ bool CTradeReplicator::ReplicateMarketOrder(CSignal &signal)
                     " price="          + DoubleToString(price, 5) +
                     " sl="             + DoubleToString(followerSL, 5) +
                     " tp="             + DoubleToString(followerTP, 5));
+      if(m_perf != NULL) m_perf.RecordTradeCopied(0.0);
      }
    else
      {
@@ -350,6 +357,7 @@ bool CTradeReplicator::ReplicateMarketOrder(CSignal &signal)
                      "masterTicket=" + IntegerToString((long)signal.masterTicket) +
                      " symbol="       + signal.symbol +
                      " lots="         + DoubleToString(lots, 2));
+      if(m_perf != NULL) m_perf.RecordTradeFailed();
      }
 
    return ok;
@@ -427,6 +435,7 @@ bool CTradeReplicator::ReplicatePendingOrder(CSignal &signal)
                     " type="           + EnumToString(orderType) +
                     " lots="           + DoubleToString(lots, 2) +
                     " price="          + DoubleToString(signal.price, 5));
+      if(m_perf != NULL) m_perf.RecordTradeCopied(0.0);
      }
    else
      {
@@ -435,6 +444,7 @@ bool CTradeReplicator::ReplicatePendingOrder(CSignal &signal)
                      " symbol="       + signal.symbol +
                      " lots="         + DoubleToString(lots, 2) +
                      " price="        + DoubleToString(signal.price, 5));
+      if(m_perf != NULL) m_perf.RecordTradeFailed();
      }
 
    return ok;

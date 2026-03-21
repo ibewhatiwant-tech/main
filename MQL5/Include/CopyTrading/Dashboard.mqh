@@ -262,18 +262,20 @@ void CDashboard::CreateMasterLabels()
   }
 
 //+------------------------------------------------------------------+
-//| Build the follower dashboard skeleton (10 rows)                  |
+//| Build the follower dashboard skeleton (12 rows)                  |
 //|                                                                  |
 //| Row  0 : ===== COPY TRADING - FOLLOWER =====  (header)          |
-//| Row  1 : Master : <name>                                         |
-//| Row  2 : Conn   : <status>                                       |
+//| Row  1 : Master   : <name>                                       |
+//| Row  2 : Conn     : <status>                                     |
 //| Row  3 : ---------------------------------------- (separator)   |
-//| Row  4 : Today P&L  : <value>                                    |
-//| Row  5 : Total P&L  : <value>                                    |
-//| Row  6 : Drawdown   : <pct>% / <limit>%                         |
-//| Row  7 : Margin     : <pct>%                                     |
-//| Row  8 : Copied/Skip: <n> / <n>                                  |
-//| Row  9 : Halt       : <reason>                                   |
+//| Row  4 : Today P&L : <value>                                     |
+//| Row  5 : Total P&L : <value>                                     |
+//| Row  6 : Balance   : <value>          ← account balance         |
+//| Row  7 : Drawdown  : <pct>% / <limit>%                          |
+//| Row  8 : Max DD    : <pct>%           ← historical peak-to-trough|
+//| Row  9 : Margin    : <pct>%                                      |
+//| Row 10 : Copied/Sip: <n> / <n.n>     ← copies / avg slippage   |
+//| Row 11 : Halt      : <reason>                                    |
 //+------------------------------------------------------------------+
 void CDashboard::CreateFollowerLabels()
   {
@@ -303,7 +305,15 @@ void CDashboard::CreateFollowerLabels()
                m_x, m_y + line * m_lineHeight, m_colorNormal);
    line++;
 
+   CreateLabel(LabelName(line), "Balance   : ---",
+               m_x, m_y + line * m_lineHeight, m_colorNormal);
+   line++;
+
    CreateLabel(LabelName(line), "Drawdown  : 0.0% / 0.0%",
+               m_x, m_y + line * m_lineHeight, m_colorNormal);
+   line++;
+
+   CreateLabel(LabelName(line), "Max DD    : 0.0%",
                m_x, m_y + line * m_lineHeight, m_colorNormal);
    line++;
 
@@ -311,7 +321,7 @@ void CDashboard::CreateFollowerLabels()
                m_x, m_y + line * m_lineHeight, m_colorNormal);
    line++;
 
-   CreateLabel(LabelName(line), "Copied/Skp: 0 / 0",
+   CreateLabel(LabelName(line), "Copied/Sip: 0 / 0.0",
                m_x, m_y + line * m_lineHeight, m_colorNormal);
    line++;
 
@@ -423,7 +433,13 @@ void CDashboard::UpdateFollower(string masterName,
    SetLabelText(LabelName(5), "Total P&L : " + FormatPnL(totalPnL),
                 GetPnLColor(totalPnL));
 
-   // Row 6: drawdown vs limit
+   // Row 6: account balance
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   SetLabelText(LabelName(6),
+                "Balance   : " + DoubleToString(balance, 2),
+                m_colorNormal);
+
+   // Row 7: drawdown vs limit
    color ddClr = m_colorNormal;
    if(drawdownLimit > 0.0)
      {
@@ -435,12 +451,19 @@ void CDashboard::UpdateFollower(string masterName,
       else
          ddClr = m_colorPositive;
      }
-   SetLabelText(LabelName(6),
+   SetLabelText(LabelName(7),
                 "Drawdown  : " + DoubleToString(drawdownPct, 1) + "% / " +
                 DoubleToString(drawdownLimit, 1) + "%",
                 ddClr);
 
-   // Row 7: margin level
+   // Row 8: max historical drawdown (peak-to-trough %)
+   double maxDD    = (perf != NULL) ? perf.GetMaxDrawdownPct() : 0.0;
+   color  maxDDClr = (maxDD > drawdownLimit * 0.8 && drawdownLimit > 0.0) ? m_colorWarning : m_colorNormal;
+   SetLabelText(LabelName(8),
+                "Max DD    : " + DoubleToString(maxDD, 1) + "%",
+                maxDDClr);
+
+   // Row 9: margin level
    color  marginClr;
    string marginStr;
    if(marginLevel <= 0.0)
@@ -455,21 +478,21 @@ void CDashboard::UpdateFollower(string masterName,
       if(marginLevel < 150.0)
          marginClr = m_colorNegative;
      }
-   SetLabelText(LabelName(7), marginStr, marginClr);
+   SetLabelText(LabelName(9), marginStr, marginClr);
 
-   // Row 8: copied / skipped today
-   int copied  = (perf != NULL) ? perf.GetTradesCopied()  : 0;
-   int skipped = (perf != NULL) ? perf.GetTradesSkipped() : 0;
-   SetLabelText(LabelName(8),
-                "Copied/Skp: " + IntegerToString(copied) + " / " +
-                IntegerToString(skipped),
+   // Row 10: copied count / average slippage pips
+   int    copied  = (perf != NULL) ? perf.GetTradesCopied()     : 0;
+   double avgSlip = (perf != NULL) ? perf.GetAverageSlippage()  : 0.0;
+   SetLabelText(LabelName(10),
+                "Copied/Sip: " + IntegerToString(copied) + " / " +
+                DoubleToString(avgSlip, 1),
                 m_colorNormal);
 
-   // Row 9: halt status — show reason in red when halted
+   // Row 11: halt status — show reason in red when halted
    if(halted)
-      SetLabelText(LabelName(9), "Halt      : " + haltReason, m_colorNegative);
+      SetLabelText(LabelName(11), "Halt      : " + haltReason, m_colorNegative);
    else
-      SetLabelText(LabelName(9), "Halt      : ---", m_colorNormal);
+      SetLabelText(LabelName(11), "Halt      : ---", m_colorNormal);
 
    ChartRedraw();
   }
