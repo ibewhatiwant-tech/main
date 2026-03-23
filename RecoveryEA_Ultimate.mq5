@@ -7,7 +7,6 @@
 #property copyright "Recovery EA Ultimate"
 #property link      ""
 #property version   "8.00"
-#property strict
 
 #include <Trade\Trade.mqh>
 
@@ -693,17 +692,6 @@ void CheckDynamicTP()
             Print("Trailing stop hit. HW=$", gTrailingHighWater, " Current=$", netProfit);
             CloseAllCyclePositions();
             return;
-         }
-      }
-
-      // Direct target hit — close if above full target
-      if(netProfit >= target)
-      {
-         // Let trailing protect, but if we haven't activated trailing yet, close
-         if(!gTrailingActive)
-         {
-            Print("Target reached. Closing cycle. Target=$", target, " NetProfit=$", netProfit);
-            CloseAllCyclePositions();
          }
       }
    }
