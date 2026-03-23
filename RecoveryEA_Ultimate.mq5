@@ -72,7 +72,7 @@ int gM5RsiHandle;
 // Cached indicator values
 double gH4EmaFast, gH4EmaSlow;
 double gM5Ema1[2], gM5Ema2[2], gM5Ema3[2];
-double gM5Rsi[2];
+double gM5Rsi[6]; // 6 bars: [0]=current .. [5]=oldest for lookback window
 
 // Fill mode
 ENUM_ORDER_TYPE_FILLING gFillType;
@@ -92,6 +92,9 @@ double gInitialEquity;        // Equity at cycle start
 
 // New bar detection
 datetime gLastBarTime;
+
+// Diagnostic logging counter
+int gDiagCounter;
 
 // Trade object
 CTrade gTrade;
@@ -151,6 +154,7 @@ int OnInit()
    gTrailingHighWater = 0.0;
    gTrailingActive    = false;
    gLastBarTime       = 0;
+   gDiagCounter       = 0;
 
    // Store initial equity
    gInitialEquity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -204,7 +208,24 @@ void OnTick()
       // 4. New entry logic — only on new M5 bar
       if(IsNewBar())
       {
+         gDiagCounter++;
+
          ENUM_TREND trend = GetH4Trend();
+
+         // Diagnostic log every 12 bars (~1 hour on M5)
+         if(gDiagCounter % 12 == 1)
+         {
+            bool emaUp = (gM5Ema1[0] > gM5Ema2[0]) && (gM5Ema2[0] > gM5Ema3[0]);
+            bool emaDn = (gM5Ema1[0] < gM5Ema2[0]) && (gM5Ema2[0] < gM5Ema3[0]);
+            long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+            Print("DIAG: H4=", (trend==TREND_BULL?"BULL":(trend==TREND_BEAR?"BEAR":"FLAT")),
+                  " EMA_UP=", emaUp, " EMA_DN=", emaDn,
+                  " RSI=", DoubleToString(gM5Rsi[0],1),
+                  " RSI[1]=", DoubleToString(gM5Rsi[1],1),
+                  " RSI[2]=", DoubleToString(gM5Rsi[2],1),
+                  " Spread=", spread);
+         }
+
          if(trend == TREND_FLAT)
          {
             if(InpShowDashboard) UpdateDashboard(trend);
@@ -213,6 +234,9 @@ void OnTick()
 
          if(!CheckSpreadFilter())
          {
+            if(gDiagCounter % 12 == 1)
+               Print("DIAG: Entry blocked by spread filter. Spread=",
+                     SymbolInfoInteger(_Symbol, SYMBOL_SPREAD), " Max=", InpMaxSpread);
             if(InpShowDashboard) UpdateDashboard(trend);
             return;
          }
@@ -269,9 +293,12 @@ bool CacheIndicators()
    if(CopyBuffer(gM5Ema3Handle, 0, 0, 2, buf2) < 2) return false;
    gM5Ema3[0] = buf2[1]; gM5Ema3[1] = buf2[0];
 
-   // M5 RSI — need bar[0] and bar[1]
-   if(CopyBuffer(gM5RsiHandle, 0, 0, 2, buf2) < 2) return false;
-   gM5Rsi[0] = buf2[1]; gM5Rsi[1] = buf2[0];
+   // M5 RSI — need bar[0] through bar[5] for lookback window
+   double bufRsi[6];
+   if(CopyBuffer(gM5RsiHandle, 0, 0, 6, bufRsi) < 6) return false;
+   // CopyBuffer returns oldest-first; reverse to [0]=current, [5]=oldest
+   for(int r = 0; r < 6; r++)
+      gM5Rsi[r] = bufRsi[5 - r];
 
    return true;
 }
@@ -299,23 +326,36 @@ ENUM_TREND GetH4Trend()
 //+------------------------------------------------------------------+
 ENUM_SIGNAL GetM5Signal(ENUM_TREND trend)
 {
-   // Buy: EMA alignment + RSI reversal from oversold + H4 bull
+   // Buy: EMA alignment + RSI recovered from oversold within lookback + H4 bull
    if(trend == TREND_BULL)
    {
       bool emaAligned = (gM5Ema1[0] > gM5Ema2[0]) && (gM5Ema2[0] > gM5Ema3[0]);
-      bool rsiReversal = (gM5Rsi[1] < InpRSI_Oversold) && (gM5Rsi[0] >= InpRSI_Oversold);
 
-      if(emaAligned && rsiReversal)
+      // RSI was oversold at any point in bars[1..5] AND current bar is above threshold
+      bool wasOversold = false;
+      for(int i = 1; i <= 5; i++)
+      {
+         if(gM5Rsi[i] < InpRSI_Oversold) { wasOversold = true; break; }
+      }
+      bool rsiRecovered = wasOversold && (gM5Rsi[0] >= InpRSI_Oversold);
+
+      if(emaAligned && rsiRecovered)
          return SIGNAL_BUY;
    }
 
-   // Sell: EMA alignment + RSI reversal from overbought + H4 bear
+   // Sell: EMA alignment + RSI recovered from overbought within lookback + H4 bear
    if(trend == TREND_BEAR)
    {
       bool emaAligned = (gM5Ema1[0] < gM5Ema2[0]) && (gM5Ema2[0] < gM5Ema3[0]);
-      bool rsiReversal = (gM5Rsi[1] > InpRSI_Overbought) && (gM5Rsi[0] <= InpRSI_Overbought);
 
-      if(emaAligned && rsiReversal)
+      bool wasOverbought = false;
+      for(int i = 1; i <= 5; i++)
+      {
+         if(gM5Rsi[i] > InpRSI_Overbought) { wasOverbought = true; break; }
+      }
+      bool rsiRecovered = wasOverbought && (gM5Rsi[0] <= InpRSI_Overbought);
+
+      if(emaAligned && rsiRecovered)
          return SIGNAL_SELL;
    }
 
