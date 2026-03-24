@@ -703,7 +703,7 @@ void SmartShaving()
    // C2 fix: decrement layer count by number of positions closed
    if(closedCount > 0)
    {
-      gLayerCount = MathMax(gLayerCount - closedCount, 0);
+      gLayerCount = (int)MathMax(gLayerCount - closedCount, 0);
 
       // If all positions closed, end cycle
       int remaining = CountCyclePositions();
