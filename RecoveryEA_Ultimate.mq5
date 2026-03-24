@@ -85,10 +85,12 @@ double gVolStep, gVolMin, gVolMax;
 // Cycle state
 int    gCycleDirection;       // 1=Buy, -1=Sell, 0=none
 int    gLayerCount;
+double gCycleBaseLot;         // Base lot locked at cycle start (C1 fix)
 double gCycleProfitBuffer;    // Accumulated shaving profit
 double gTrailingHighWater;    // Trailing basket high-water mark
 bool   gTrailingActive;
 double gInitialEquity;        // Equity at cycle start
+double gAccountStartEquity;   // Account equity at EA start (H3 fix)
 
 // New bar detection
 datetime gLastBarTime;
@@ -147,9 +149,17 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   // Validate SYMBOL_POINT (C3 fix)
+   if(gPoint <= 0.0)
+   {
+      Print("ERROR: Invalid SYMBOL_POINT=", gPoint, " for ", _Symbol);
+      return INIT_FAILED;
+   }
+
    // Initialize state
    gCycleDirection    = 0;
    gLayerCount        = 0;
+   gCycleBaseLot      = 0.0;
    gCycleProfitBuffer = 0.0;
    gTrailingHighWater = 0.0;
    gTrailingActive    = false;
@@ -158,6 +168,7 @@ int OnInit()
 
    // Store initial equity
    gInitialEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   gAccountStartEquity = gInitialEquity; // H3: account-level baseline
 
    // Recover persisted state
    RecoverState();
@@ -190,11 +201,21 @@ void OnTick()
 {
    // 1. Cache indicator values
    if(!CacheIndicators())
+   {
+      // M3 fix: log data gap (throttled)
+      static int cacheFailCount = 0;
+      cacheFailCount++;
+      if(cacheFailCount % 100 == 1)
+         Print("WARN: CacheIndicators failed. Count=", cacheFailCount, " Time=", TimeCurrent());
       return;
+   }
 
    // 2. Equity cutoff — kill switch
    if(CheckEquityCutoff())
       return;
+
+   // M1 fix: compute trend once, reuse for dashboard
+   ENUM_TREND currentTrend = GetH4Trend();
 
    // 3. Active cycle management
    if(HasOpenCycle())
@@ -210,15 +231,13 @@ void OnTick()
       {
          gDiagCounter++;
 
-         ENUM_TREND trend = GetH4Trend();
-
          // Diagnostic log every 12 bars (~1 hour on M5)
          if(gDiagCounter % 12 == 1)
          {
             bool emaUp = (gM5Ema1[0] > gM5Ema2[0]) && (gM5Ema2[0] > gM5Ema3[0]);
             bool emaDn = (gM5Ema1[0] < gM5Ema2[0]) && (gM5Ema2[0] < gM5Ema3[0]);
             long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-            Print("DIAG: H4=", (trend==TREND_BULL?"BULL":(trend==TREND_BEAR?"BEAR":"FLAT")),
+            Print("DIAG: H4=", (currentTrend==TREND_BULL?"BULL":(currentTrend==TREND_BEAR?"BEAR":"FLAT")),
                   " EMA_UP=", emaUp, " EMA_DN=", emaDn,
                   " RSI=", DoubleToString(gM5Rsi[0],1),
                   " RSI[1]=", DoubleToString(gM5Rsi[1],1),
@@ -226,9 +245,9 @@ void OnTick()
                   " Spread=", spread);
          }
 
-         if(trend == TREND_FLAT)
+         if(currentTrend == TREND_FLAT)
          {
-            if(InpShowDashboard) UpdateDashboard(trend);
+            if(InpShowDashboard) UpdateDashboard(currentTrend);
             return;
          }
 
@@ -237,19 +256,19 @@ void OnTick()
             if(gDiagCounter % 12 == 1)
                Print("DIAG: Entry blocked by spread filter. Spread=",
                      SymbolInfoInteger(_Symbol, SYMBOL_SPREAD), " Max=", InpMaxSpread);
-            if(InpShowDashboard) UpdateDashboard(trend);
+            if(InpShowDashboard) UpdateDashboard(currentTrend);
             return;
          }
 
-         ENUM_SIGNAL signal = GetM5Signal(trend);
+         ENUM_SIGNAL signal = GetM5Signal(currentTrend);
          if(signal != SIGNAL_NONE)
             OpenInitialEntry(signal);
       }
    }
 
-   // 5. Dashboard
+   // 5. Dashboard — M1 fix: reuse cached trend
    if(InpShowDashboard)
-      UpdateDashboard(GetH4Trend());
+      UpdateDashboard(currentTrend);
 }
 
 //+------------------------------------------------------------------+
@@ -405,7 +424,8 @@ double CalculateBaseLot()
 //+------------------------------------------------------------------+
 double GetFibonacciLot(int layer)
 {
-   double baseLot = CalculateBaseLot();
+   // C1 fix: use base lot locked at cycle start, not live equity
+   double baseLot = (gCycleBaseLot > 0) ? gCycleBaseLot : CalculateBaseLot();
    int idx = MathMin(layer, 7);
    double lot = baseLot * FibMultiplier[idx];
    return FinalizeLot(lot);
@@ -464,15 +484,24 @@ void OpenInitialEntry(ENUM_SIGNAL signal)
 
    if(gTrade.PositionOpen(_Symbol, orderType, lot, price, 0, 0, comment))
    {
+      // H1 fix: verify fill volume
+      double filledLot = gTrade.ResultVolume();
+      if(filledLot <= 0)
+      {
+         Print("WARN: Initial entry accepted but ResultVolume=0. Possible partial fill.");
+      }
+
       gCycleDirection = (signal == SIGNAL_BUY) ? 1 : -1;
       gLayerCount = 1;
+      gCycleBaseLot = lot;  // C1 fix: lock base lot for entire cycle
       gCycleProfitBuffer = 0.0;
       gTrailingHighWater = 0.0;
       gTrailingActive = false;
       gInitialEquity = AccountInfoDouble(ACCOUNT_EQUITY);
 
       SaveState();
-      Print("Opened initial entry: ", EnumToString(orderType), " Lot=", lot);
+      Print("Opened initial entry: ", EnumToString(orderType), " Lot=", lot,
+            " Filled=", filledLot);
    }
    else
    {
@@ -573,9 +602,21 @@ void ManageRecovery()
 
    if(gTrade.PositionOpen(_Symbol, hedgeType, lot, price, 0, 0, comment))
    {
-      gLayerCount++;
-      SaveState();
-      Print("Opened recovery layer ", gLayerCount, ": ", EnumToString(hedgeType), " Lot=", lot);
+      // H1 fix: verify fill volume before incrementing layer
+      double filledLot = gTrade.ResultVolume();
+      if(filledLot < lot * 0.9)
+      {
+         Print("WARN: Recovery layer partial fill. Requested=", lot,
+               " Filled=", filledLot, ". Layer NOT incremented.");
+         // Do not increment gLayerCount — Fibonacci sizing would be wrong
+      }
+      else
+      {
+         gLayerCount++;
+         SaveState();
+         Print("Opened recovery layer ", gLayerCount, ": ", EnumToString(hedgeType),
+               " Lot=", lot, " Filled=", filledLot);
+      }
    }
    else
    {
@@ -588,9 +629,9 @@ void ManageRecovery()
 //+------------------------------------------------------------------+
 void SmartShaving()
 {
-   // Need at least 3 positions to shave (keep at least 1 open)
+   // H2 fix: allow shaving with 2+ positions (was 3)
    int totalPositions = CountCyclePositions();
-   if(totalPositions < 3) return;
+   if(totalPositions < 2) return;
 
    // Find the most profitable and the deepest losing position
    ulong bestTicket = 0, worstTicket = 0;
@@ -621,7 +662,7 @@ void SmartShaving()
       return;
 
    // Only shave if the best leg is profitable enough ($2 per layer minimum)
-   double shaveThreshold = 2.0 * gLayerCount;
+   double shaveThreshold = 2.0 * MathMax(gLayerCount, 1);
    if(bestProfit < shaveThreshold)
       return;
 
@@ -634,20 +675,21 @@ void SmartShaving()
    long freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
    if(freezeLevel > 0)
    {
-      // Verify positions are not frozen
       if(!CanClosePosition(bestTicket, freezeLevel) || !CanClosePosition(worstTicket, freezeLevel))
          return;
    }
 
    // Close both positions
+   int closedCount = 0;
    bool closedBest = gTrade.PositionClose(bestTicket);
    if(closedBest)
    {
+      closedCount++;
       bool closedWorst = gTrade.PositionClose(worstTicket);
       if(closedWorst)
       {
+         closedCount++;
          gCycleProfitBuffer += netResult;
-         SaveState();
          Print("Shaved pair: Best=$", bestProfit, " Worst=$", worstProfit, " Net=$", netResult,
                " Buffer=$", gCycleProfitBuffer);
       }
@@ -655,6 +697,23 @@ void SmartShaving()
       {
          Print("WARN: Closed best leg but failed to close worst. Error=", GetLastError());
          gCycleProfitBuffer += bestProfit;
+      }
+   }
+
+   // C2 fix: decrement layer count by number of positions closed
+   if(closedCount > 0)
+   {
+      gLayerCount = MathMax(gLayerCount - closedCount, 0);
+
+      // If all positions closed, end cycle
+      int remaining = CountCyclePositions();
+      if(remaining == 0)
+      {
+         Print("Shaving closed all positions. Cycle complete. Buffer=$", gCycleProfitBuffer);
+         ResetCycleState();
+      }
+      else
+      {
          SaveState();
       }
    }
@@ -802,14 +861,27 @@ int CountCyclePositions()
 //+------------------------------------------------------------------+
 bool CheckEquityCutoff()
 {
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   // H3 fix: account-level equity baseline — always active regardless of cycle
+   double accountCutoff = gAccountStartEquity * (1.0 - InpEquityCutoffPct / 100.0);
+   if(equity < accountCutoff)
+   {
+      Print("!!! ACCOUNT EQUITY CUTOFF !!! Equity=$", equity,
+            " Cutoff=$", accountCutoff, " (AccountStart=$", gAccountStartEquity, ")");
+      if(gCycleDirection != 0)
+         CloseAllCyclePositions();
+      return true;
+   }
+
+   // Per-cycle equity cutoff
    if(gCycleDirection == 0) return false;
 
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double cutoffLevel = gInitialEquity * (1.0 - InpEquityCutoffPct / 100.0);
-
-   if(equity < cutoffLevel)
+   double cycleCutoff = gInitialEquity * (1.0 - InpEquityCutoffPct / 100.0);
+   if(equity < cycleCutoff)
    {
-      Print("!!! EQUITY CUTOFF TRIGGERED !!! Equity=$", equity, " Cutoff=$", cutoffLevel);
+      Print("!!! CYCLE EQUITY CUTOFF !!! Equity=$", equity,
+            " Cutoff=$", cycleCutoff, " (CycleStart=$", gInitialEquity, ")");
       CloseAllCyclePositions();
       return true;
    }
@@ -823,6 +895,7 @@ void SaveState()
 {
    GlobalVariableSet(gGVPrefix + "CycleDir",     (double)gCycleDirection);
    GlobalVariableSet(gGVPrefix + "LayerCount",   (double)gLayerCount);
+   GlobalVariableSet(gGVPrefix + "BaseLot",      gCycleBaseLot);        // C1 fix
    GlobalVariableSet(gGVPrefix + "ProfitBuffer", gCycleProfitBuffer);
    GlobalVariableSet(gGVPrefix + "TrailHigh",    gTrailingHighWater);
    GlobalVariableSet(gGVPrefix + "TrailActive",  gTrailingActive ? 1.0 : 0.0);
@@ -836,6 +909,7 @@ void RecoverState()
    {
       gCycleDirection    = (int)GlobalVariableGet(gGVPrefix + "CycleDir");
       gLayerCount        = (int)GlobalVariableGet(gGVPrefix + "LayerCount");
+      gCycleBaseLot      = GlobalVariableGet(gGVPrefix + "BaseLot");  // C1 fix
       gCycleProfitBuffer = GlobalVariableGet(gGVPrefix + "ProfitBuffer");
       gTrailingHighWater = GlobalVariableGet(gGVPrefix + "TrailHigh");
       gTrailingActive    = (GlobalVariableGet(gGVPrefix + "TrailActive") > 0.5);
@@ -852,6 +926,7 @@ void ClearState()
 {
    GlobalVariableDel(gGVPrefix + "CycleDir");
    GlobalVariableDel(gGVPrefix + "LayerCount");
+   GlobalVariableDel(gGVPrefix + "BaseLot");      // C1 fix
    GlobalVariableDel(gGVPrefix + "ProfitBuffer");
    GlobalVariableDel(gGVPrefix + "TrailHigh");
    GlobalVariableDel(gGVPrefix + "TrailActive");
@@ -863,6 +938,7 @@ void ResetCycleState()
 {
    gCycleDirection    = 0;
    gLayerCount        = 0;
+   gCycleBaseLot      = 0.0;  // C1 fix
    gCycleProfitBuffer = 0.0;
    gTrailingHighWater = 0.0;
    gTrailingActive    = false;
@@ -890,17 +966,20 @@ void UpdateDashboard(ENUM_TREND trend)
    if(gCycleDirection == 1)  cycleStr = "BUY";
    if(gCycleDirection == -1) cycleStr = "SELL";
 
-   // Calculate net profit
+   // M2 fix: skip position loop when no cycle active
    double floatingPL = 0;
    double totalVolume = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   if(gCycleDirection != 0)
    {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      floatingPL  += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-      totalVolume += PositionGetDouble(POSITION_VOLUME);
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         floatingPL  += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+         totalVolume += PositionGetDouble(POSITION_VOLUME);
+      }
    }
    double netProfit = floatingPL + gCycleProfitBuffer;
 
