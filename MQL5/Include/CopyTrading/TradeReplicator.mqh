@@ -45,6 +45,11 @@ private:
    int               m_allowedSymbolCount;
    bool              m_filterSymbols;
 
+   //--- Symbol name map (broker A name → broker B name)
+   string            m_symMapFrom[];
+   string            m_symMapTo[];
+   int               m_symMapCount;
+
    //--- Reconciliation
    datetime          m_lastReconcileTime;
 
@@ -104,6 +109,10 @@ public:
    ENUM_ORDER_TYPE   ApplyDirectionFilter(ENUM_ORDER_TYPE orderType);
    bool              ShouldProcessDirection(ENUM_ORDER_TYPE orderType);
 
+   //--- Symbol name mapping (broker suffix translation)
+   void              SetSymbolMap(string mapStr);
+   string            MapSymbol(string symbol) const;
+
    //--- Accessors
    int               GetPositionMapCount() const { return m_positionMapCount; }
   };
@@ -125,6 +134,7 @@ CTradeReplicator::CTradeReplicator()
    m_dirFilter          = DIR_BOTH;
    m_allowedSymbolCount = 0;
    m_filterSymbols      = false;
+   m_symMapCount        = 0;
    m_lastReconcileTime  = 0;
    m_posMapFile         = "";
   }
@@ -185,9 +195,10 @@ bool CTradeReplicator::Init(CLogger              *logger,
    m_followerId   = followerId;
    m_magicNumber  = (magicNumber > 0) ? magicNumber : CT_MAGIC_NUMBER;
    m_slippage     = (slippage    > 0) ? slippage    : CT_MAX_SLIPPAGE;
-   m_dirFilter    = DIR_BOTH;
-   m_filterSymbols = false;
+   m_dirFilter          = DIR_BOTH;
+   m_filterSymbols      = false;
    m_allowedSymbolCount = 0;
+   m_symMapCount        = 0;
    m_lastReconcileTime  = 0;
 
    m_posMapFile = CT_STATE_DIR + CT_POSMAP_PREFIX + followerId + ".csv";
@@ -215,6 +226,15 @@ void CTradeReplicator::ProcessSignal(CSignal &signal)
                  " type=" + IntegerToString((int)signal.type),
                  "symbol=" + signal.symbol +
                  " masterTicket=" + IntegerToString((long)signal.masterTicket));
+
+   // Translate master broker symbol name to follower broker symbol name
+   string mapped = MapSymbol(signal.symbol);
+   if(mapped != signal.symbol)
+     {
+      m_logger.Info("Symbol mapped: " + signal.symbol + " -> " + mapped,
+                    "signalId=" + signal.signalId);
+      signal.symbol = mapped;
+     }
 
    // Direction and symbol filters apply only to order-opening signals
    if(signal.type == SIGNAL_MARKET_ORDER || signal.type == SIGNAL_PENDING_ORDER)
@@ -1037,5 +1057,71 @@ bool CTradeReplicator::IsBuyType(ENUM_ORDER_TYPE t)
            t == ORDER_TYPE_BUY_LIMIT      ||
            t == ORDER_TYPE_BUY_STOP       ||
            t == ORDER_TYPE_BUY_STOP_LIMIT);
+  }
+
+//+------------------------------------------------------------------+
+//| SetSymbolMap — parse "MasterSym=FollowerSym,..." mapping string  |
+//| Example: "XAUUSDm=XAUUSD,EURUSDm=EURUSD"                        |
+//+------------------------------------------------------------------+
+void CTradeReplicator::SetSymbolMap(string mapStr)
+  {
+   m_symMapCount = 0;
+
+   if(mapStr == "")
+     {
+      m_logger.Info("SetSymbolMap — no symbol mapping configured");
+      return;
+     }
+
+   string pairs[];
+   int pairCount = StringSplit(mapStr, ',', pairs);
+
+   ArrayResize(m_symMapFrom, pairCount);
+   ArrayResize(m_symMapTo,   pairCount);
+
+   for(int i = 0; i < pairCount; i++)
+     {
+      string p = pairs[i];
+      StringTrimLeft(p);
+      StringTrimRight(p);
+
+      int eq = StringFind(p, "=");
+      if(eq <= 0 || eq >= StringLen(p) - 1)
+        {
+         m_logger.Warn("SetSymbolMap — skipping malformed entry: " + p);
+         continue;
+        }
+
+      string fromSym = StringSubstr(p, 0, eq);
+      string toSym   = StringSubstr(p, eq + 1);
+      StringTrimLeft(fromSym);  StringTrimRight(fromSym);
+      StringTrimLeft(toSym);    StringTrimRight(toSym);
+
+      if(fromSym == "" || toSym == "")
+        {
+         m_logger.Warn("SetSymbolMap — empty symbol in entry: " + p);
+         continue;
+        }
+
+      m_symMapFrom[m_symMapCount] = fromSym;
+      m_symMapTo[m_symMapCount]   = toSym;
+      m_symMapCount++;
+
+      m_logger.Info("SetSymbolMap — mapped: " + fromSym + " -> " + toSym);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| MapSymbol — translate a master symbol to the follower equivalent |
+//| Returns the original symbol unchanged when no mapping is defined |
+//+------------------------------------------------------------------+
+string CTradeReplicator::MapSymbol(string symbol) const
+  {
+   for(int i = 0; i < m_symMapCount; i++)
+     {
+      if(m_symMapFrom[i] == symbol)
+         return m_symMapTo[i];
+     }
+   return symbol;
   }
 #endif // COPYTRADING_TRADEREPLICATOR_MQH

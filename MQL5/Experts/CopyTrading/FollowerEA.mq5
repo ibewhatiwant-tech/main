@@ -52,6 +52,7 @@ input int             InpEmergencySLPips    = 100;         // Emergency stop los
 input bool            InpFilterSymbols      = false;       // Enable symbol filter
 input string          InpAllowedSymbols     = "";          // Allowed symbols (comma-separated, blank=all)
 input ENUM_DIRECTION_FILTER InpDirFilter    = DIR_BOTH;   // Direction filter
+input string          InpSymbolMap          = "";          // Symbol name map: "MasterSym=FollowerSym,..." (e.g. XAUUSDm=XAUUSD)
 
 //--- Time Filtering
 input bool            InpEnableTimeFilter   = false;       // Enable trading hours filter
@@ -105,6 +106,12 @@ int OnInit()
    Print("Account: ", AccountInfoString(ACCOUNT_NAME),
          " #", AccountInfoInteger(ACCOUNT_LOGIN));
    Print("==================================================");
+
+   //--- Ensure shared directories exist (broker common folder)
+   FolderCreate("CopyTrading",  FILE_COMMON);
+   FolderCreate(CT_SIGNAL_DIR,  FILE_COMMON);
+   FolderCreate(CT_STATE_DIR,   FILE_COMMON);
+   FolderCreate(CT_LOG_DIR,     FILE_COMMON);
 
    //--- Validate required inputs
    if(InpMasterSignalID == "")
@@ -181,6 +188,8 @@ int OnInit()
    if(InpFilterSymbols && InpAllowedSymbols != "")
       g_replicator.SetSymbolFilter(InpAllowedSymbols);
    g_replicator.SetDirectionFilter(InpDirFilter);
+   if(InpSymbolMap != "")
+      g_replicator.SetSymbolMap(InpSymbolMap);
 
    //--- Initialize performance tracker
    if(!g_perfTracker.Init(&g_logger, g_followerId, false))

@@ -78,6 +78,12 @@ int OnInit()
          " #", AccountInfoInteger(ACCOUNT_LOGIN));
    Print("==================================================");
 
+   //--- Ensure shared directories exist (broker common folder)
+   FolderCreate("CopyTrading",  FILE_COMMON);
+   FolderCreate(CT_SIGNAL_DIR,  FILE_COMMON);
+   FolderCreate(CT_STATE_DIR,   FILE_COMMON);
+   FolderCreate(CT_LOG_DIR,     FILE_COMMON);
+
    //--- Generate master ID from account number
    g_masterId = IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
 
