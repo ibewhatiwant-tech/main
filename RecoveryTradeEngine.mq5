@@ -312,18 +312,461 @@ public:
 };
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 5 — CRiskGuard  [Phase 3]
+// SECTION 5 — CRiskGuard
+//  Responsibilities:
+//    • Spread filter (IsSpreadAcceptable)
+//    • Lot size computation (ComputeLot)
+//    • Per-request validation (ValidateRequest)
+//    • Hard stop flag management (CheckAndSetHardStop / IsHardStopBreached)
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 3
+class CRiskGuard
+{
+private:
+   CLogger*  m_logger;
+   double    m_maxSpreadPoints;   // Max acceptable spread in broker points
+   double    m_maxLot;            // Absolute lot cap regardless of risk calc
+   double    m_riskPercent;       // % of account balance risked per trade
+   double    m_hardStopUSD;       // Basket loss that triggers forced close
+   bool      m_hardStopBreached;  // Sticky flag; cleared only on ClearHardStop()
+
+   //--- Clamp and normalise a raw lot to broker constraints
+   double NormaliseLot(const string symbol, double rawLot) const
+   {
+      double lotMin  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+      double lotMax  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+      double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+      if(lotStep <= 0.0) lotStep = 0.01;
+
+      double capped = MathMin(m_maxLot, MathMin(lotMax, MathMax(lotMin, rawLot)));
+      double steps  = MathRound(capped / lotStep);
+      return NormalizeDouble(steps * lotStep, 2);
+   }
+
+public:
+   CRiskGuard(CLogger* logger)
+      : m_logger(logger),
+        m_maxSpreadPoints(RTE_DEFAULT_MAX_SPREAD),
+        m_maxLot(RTE_DEFAULT_MAX_LOT),
+        m_riskPercent(RTE_DEFAULT_RISK_PERCENT),
+        m_hardStopUSD(RTE_DEFAULT_HARD_STOP_USD),
+        m_hardStopBreached(false) {}
+
+   //--- Called from OnInit() after input parameters are available
+   void Init(double maxSpreadPoints, double maxLot,
+             double riskPercent,     double hardStopUSD)
+   {
+      m_maxSpreadPoints = maxSpreadPoints;
+      m_maxLot          = maxLot;
+      m_riskPercent     = riskPercent;
+      m_hardStopUSD     = hardStopUSD;
+      m_logger.Info("RiskGuard",
+         StringFormat("Init — MaxSpread:%.0f pts  MaxLot:%.2f  Risk:%.2f%%  HardStop:%.2f USD",
+         maxSpreadPoints, maxLot, riskPercent, hardStopUSD));
+   }
+
+   //--- Returns true when current spread is within the configured limit
+   bool IsSpreadAcceptable(const string symbol) const
+   {
+      long spreadPts = SymbolInfoInteger(symbol, SYMBOL_SPREAD);
+      return (spreadPts <= (long)m_maxSpreadPoints);
+   }
+
+   //--- Compute risk-based lot size given a stop distance (in MT5 points).
+   //    Returns the broker-normalised lot, never exceeding m_maxLot.
+   //    Falls back to SYMBOL_VOLUME_MIN if stop distance is zero.
+   double ComputeLot(const string symbol, double stopDistancePoints) const
+   {
+      double lotMin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+      if(stopDistancePoints <= 0.0)
+      {
+         m_logger.Warn("RiskGuard", "ComputeLot: stopDistancePoints <= 0; returning min lot");
+         return lotMin;
+      }
+
+      double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+      double risk     = balance * m_riskPercent / 100.0;
+
+      // Monetary value of one tick move for 1 standard lot (account currency)
+      double tickVal  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+      if(tickVal <= 0.0 || tickSize <= 0.0)
+      {
+         m_logger.Error("RiskGuard",
+            StringFormat("ComputeLot: invalid tick info tickVal=%.6f tickSize=%.6f",
+            tickVal, tickSize));
+         return lotMin;
+      }
+
+      // How many ticks is the stop distance?  Then monetary cost per lot.
+      double stopInTicks  = (stopDistancePoints * _Point) / tickSize;
+      double riskPerLot   = stopInTicks * tickVal;
+      if(riskPerLot <= 0.0) return lotMin;
+
+      double rawLot = risk / riskPerLot;
+      double lot    = NormaliseLot(symbol, rawLot);
+
+      m_logger.Debug("RiskGuard",
+         StringFormat("ComputeLot — balance:%.2f risk:%.2f stop:%.1f pts rawLot:%.4f lot:%.2f",
+         balance, risk, stopDistancePoints, rawLot, lot));
+      return lot;
+   }
+
+   //--- Full pre-flight validation called by CExecutionEngine before every order.
+   //    Checks spread and broker lot bounds; may return an adjusted (clamped) lot.
+   ValidationResult ValidateRequest(const TradeRequest& req) const
+   {
+      ValidationResult vr;
+
+      // Spread check
+      if(!IsSpreadAcceptable(req.symbol))
+      {
+         long sp = SymbolInfoInteger(req.symbol, SYMBOL_SPREAD);
+         m_logger.Warn("RiskGuard",
+            StringFormat("Spread rejected — current:%d pts  max:%.0f pts  tag:%s",
+            sp, m_maxSpreadPoints, req.contextTag));
+         vr.isValid    = false;
+         vr.failReason = REJECT_SPREAD_TOO_HIGH;
+         return vr;
+      }
+
+      // Lot bounds check
+      double lotMin  = SymbolInfoDouble(req.symbol, SYMBOL_VOLUME_MIN);
+      double lotMax  = SymbolInfoDouble(req.symbol, SYMBOL_VOLUME_MAX);
+      double lotStep = SymbolInfoDouble(req.symbol, SYMBOL_VOLUME_STEP);
+      if(lotStep <= 0.0) lotStep = 0.01;
+
+      if(req.lotSize < lotMin || req.lotSize > MathMin(m_maxLot, lotMax))
+      {
+         m_logger.Warn("RiskGuard",
+            StringFormat("Lot rejected — lot:%.2f  min:%.2f  max:%.2f  cap:%.2f  tag:%s",
+            req.lotSize, lotMin, lotMax, m_maxLot, req.contextTag));
+         vr.isValid    = false;
+         vr.failReason = REJECT_LOT_INVALID;
+         return vr;
+      }
+
+      // Normalise (clamp to step) and surface adjusted value
+      vr.isValid     = true;
+      vr.failReason  = REJECT_NONE;
+      vr.adjustedLot = NormaliseLot(req.symbol, req.lotSize);
+      return vr;
+   }
+
+   //--- Called every tick by CBasketMonitor/CRecoveryEngine with live P&L.
+   //    Once breached the flag is sticky until ClearHardStop() is called.
+   void CheckAndSetHardStop(double basketPnlUSD)
+   {
+      if(m_hardStopBreached) return;   // Already set; no need to re-log
+      if(basketPnlUSD < 0.0 && MathAbs(basketPnlUSD) >= m_hardStopUSD)
+      {
+         m_hardStopBreached = true;
+         m_logger.Fatal("RiskGuard",
+            StringFormat("HARD STOP BREACHED — basket P&L: %.2f USD  threshold: %.2f USD",
+            basketPnlUSD, m_hardStopUSD));
+      }
+   }
+
+   bool IsHardStopBreached() const { return m_hardStopBreached; }
+
+   void ClearHardStop()
+   {
+      if(m_hardStopBreached)
+         m_logger.Info("RiskGuard", "Hard stop flag cleared for new basket cycle.");
+      m_hardStopBreached = false;
+   }
+};
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 6 — CExecutionEngine  [Phase 3]
-//      NOTE: Only this section may use CTrade / OrderSend.
-//            #include <Trade\Trade.mqh> will be added here in Phase 3.
+// SECTION 6 — CExecutionEngine
+//  *** SOLE TRADE GATEWAY — only class that calls CTrade ***
+//  Responsibilities:
+//    • Accept TradeRequest, run validation chain, dispatch via CTrade
+//    • Maintain dedupe registry (parallel arrays, fixed capacity)
+//    • Return TradeResult on every call
+//    • ClearRegistry() resets state for the next basket lifecycle
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 3
+#include <Trade\Trade.mqh>   // ← only #include of Trade lib in the entire file
+
+class CExecutionEngine
+{
+private:
+   CTrade      m_trade;
+   CRiskGuard* m_riskGuard;
+   CLogger*    m_logger;
+
+   //--- Dedupe registry: fixed-capacity parallel arrays
+   //    Entries are added on successful dispatch only.
+   //    Cleared on CLOSE → IDLE via ClearRegistry().
+   string      m_regKeys   [RTE_MAX_REGISTRY_SIZE];
+   ulong       m_regTickets[RTE_MAX_REGISTRY_SIZE];
+   datetime    m_regTimes  [RTE_MAX_REGISTRY_SIZE];
+   int         m_regCount;
+
+   //--- Monotonic counter used to tag each unique request internally
+   ulong       m_requestCounter;
+
+   // ── Dedupe helpers ────────────────────────────────────────────────
+
+   //--- Build a deterministic key from fields that uniquely identify
+   //    the trading intent within one basket lifecycle.
+   //    Format: {Symbol}|{OrderType}|{Direction}|{LotNorm}|{ContextTag}
+   string BuildDedupeKey(const TradeRequest& req) const
+   {
+      return StringFormat("%s|%d|%d|%.2f|%s",
+         req.symbol,
+         (int)req.orderType,
+         (int)req.direction,
+         req.lotSize,
+         req.contextTag);
+   }
+
+   bool IsInRegistry(const string key) const
+   {
+      for(int i = 0; i < m_regCount; i++)
+         if(m_regKeys[i] == key) return true;
+      return false;
+   }
+
+   void AddToRegistry(const string key, ulong ticket)
+   {
+      if(m_regCount >= RTE_MAX_REGISTRY_SIZE)
+      {
+         m_logger.Error("ExecEngine",
+            "Registry full — cannot register key: " + key);
+         return;
+      }
+      m_regKeys   [m_regCount] = key;
+      m_regTickets[m_regCount] = ticket;
+      m_regTimes  [m_regCount] = TimeCurrent();
+      m_regCount++;
+      m_logger.Debug("ExecEngine",
+         StringFormat("Registry add [%d/%d] key=%s ticket=%I64u",
+         m_regCount, RTE_MAX_REGISTRY_SIZE, key, ticket));
+   }
+
+   // ── Validation chain ──────────────────────────────────────────────
+
+   //--- Returns REJECT_NONE on pass; populates res on any failure
+   ENUM_REJECTION_REASON RunValidationChain(const TradeRequest& req,
+                                             TradeResult&        res,
+                                             string&             dedupeKey)
+   {
+      // 1. Lot must have been validated by CRiskGuard before calling Submit()
+      if(!req.isLotValidated)
+      {
+         m_logger.Error("ExecEngine",
+            "REJECT_LOT_NOT_VALIDATED — contextTag: " + req.contextTag);
+         return REJECT_LOT_NOT_VALIDATED;
+      }
+
+      // 2. Context tag is mandatory (dedupe key requires it)
+      if(req.contextTag == "")
+      {
+         m_logger.Error("ExecEngine", "REJECT_EMPTY_CONTEXT_TAG");
+         return REJECT_EMPTY_CONTEXT_TAG;
+      }
+
+      // 3. Symbol must match the EA's configured symbol
+      if(req.symbol != _Symbol)
+      {
+         m_logger.Error("ExecEngine",
+            StringFormat("REJECT_SYMBOL_MISMATCH — req:%s ea:%s",
+            req.symbol, _Symbol));
+         return REJECT_SYMBOL_MISMATCH;
+      }
+
+      // 4. Hard stop blocks all new orders
+      if(m_riskGuard.IsHardStopBreached())
+      {
+         m_logger.Warn("ExecEngine",
+            "REJECT_HARD_STOP_ACTIVE — tag: " + req.contextTag);
+         return REJECT_HARD_STOP_ACTIVE;
+      }
+
+      // 5. Dedupe check — reject if this exact intent was already dispatched
+      dedupeKey = BuildDedupeKey(req);
+      if(IsInRegistry(dedupeKey))
+      {
+         m_logger.Warn("ExecEngine",
+            "REJECT_DUPLICATE — key: " + dedupeKey);
+         return REJECT_DUPLICATE;
+      }
+
+      // 6. CRiskGuard validates spread and lot bounds
+      ValidationResult vr = m_riskGuard.ValidateRequest(req);
+      if(!vr.isValid)
+         return vr.failReason;
+
+      return REJECT_NONE;
+   }
+
+   // ── Order dispatch ────────────────────────────────────────────────
+
+   bool DispatchMarketOrder(const TradeRequest& req, TradeResult& res)
+   {
+      double price = (req.direction == ORDER_TYPE_BUY)
+                     ? SymbolInfoDouble(req.symbol, SYMBOL_ASK)
+                     : SymbolInfoDouble(req.symbol, SYMBOL_BID);
+
+      bool sent = m_trade.PositionOpen(
+         req.symbol,
+         req.orderType,   // ORDER_TYPE_BUY or ORDER_TYPE_SELL
+         req.lotSize,
+         price,
+         req.stopLoss,
+         req.takeProfit,
+         req.contextTag   // comment carries semantic tag for MT5 journal
+      );
+
+      if(sent && m_trade.ResultRetcode() == TRADE_RETCODE_DONE)
+      {
+         res.ticket        = m_trade.ResultOrder();   // = position ticket in hedging mode
+         res.executedPrice = m_trade.ResultPrice();
+         res.executedLot   = m_trade.ResultVolume();
+         res.success       = true;
+         return true;
+      }
+
+      // Transient broker failures are NOT registered — next tick can retry
+      res.errorCode       = (int)m_trade.ResultRetcode();
+      res.rejectionReason = REJECT_BROKER_REJECT;
+      m_logger.Error("ExecEngine",
+         StringFormat("Broker reject retcode:%u tag:%s",
+         m_trade.ResultRetcode(), req.contextTag));
+      return false;
+   }
+
+   bool DispatchPendingOrder(const TradeRequest& req, TradeResult& res)
+   {
+      bool sent = false;
+      switch(req.orderType)
+      {
+         case ORDER_TYPE_BUY_LIMIT:
+            sent = m_trade.BuyLimit(req.lotSize, req.takeProfit,
+                                    req.symbol, req.stopLoss, 0, 0, 0, req.contextTag);
+            break;
+         case ORDER_TYPE_SELL_LIMIT:
+            sent = m_trade.SellLimit(req.lotSize, req.takeProfit,
+                                     req.symbol, req.stopLoss, 0, 0, 0, req.contextTag);
+            break;
+         case ORDER_TYPE_BUY_STOP:
+            sent = m_trade.BuyStop(req.lotSize, req.takeProfit,
+                                   req.symbol, req.stopLoss, 0, 0, 0, req.contextTag);
+            break;
+         case ORDER_TYPE_SELL_STOP:
+            sent = m_trade.SellStop(req.lotSize, req.takeProfit,
+                                    req.symbol, req.stopLoss, 0, 0, 0, req.contextTag);
+            break;
+         default:
+            m_logger.Error("ExecEngine",
+               StringFormat("DispatchPending: unsupported orderType %d", (int)req.orderType));
+            res.rejectionReason = REJECT_BROKER_REJECT;
+            return false;
+      }
+
+      if(sent && m_trade.ResultRetcode() == TRADE_RETCODE_PLACED)
+      {
+         res.ticket  = m_trade.ResultOrder();
+         res.success = true;
+         return true;
+      }
+
+      res.errorCode       = (int)m_trade.ResultRetcode();
+      res.rejectionReason = REJECT_BROKER_REJECT;
+      m_logger.Error("ExecEngine",
+         StringFormat("Pending order broker reject retcode:%u tag:%s",
+         m_trade.ResultRetcode(), req.contextTag));
+      return false;
+   }
+
+   bool IsMarketOrder(ENUM_ORDER_TYPE t) const
+   {
+      return (t == ORDER_TYPE_BUY || t == ORDER_TYPE_SELL);
+   }
+
+public:
+   CExecutionEngine(CRiskGuard* riskGuard, CLogger* logger)
+      : m_riskGuard(riskGuard),
+        m_logger(logger),
+        m_regCount(0),
+        m_requestCounter(0) {}
+
+   //--- Called from OnInit() after CTrade parameters are known
+   void Init(int magicNumber, int slippagePoints)
+   {
+      m_trade.SetExpertMagicNumber(magicNumber);
+      m_trade.SetDeviationInPoints(slippagePoints);
+      m_trade.SetTypeFilling(ORDER_FILLING_FOK);   // Adjust per broker if needed
+      m_trade.LogLevel(LOG_LEVEL_ERRORS);          // Internal CTrade logging
+      m_logger.Info("ExecEngine",
+         StringFormat("Init — magic:%d slippage:%d pts", magicNumber, slippagePoints));
+   }
+
+   //--- Primary public interface.  All modules call ONLY this method.
+   //    Returns true when the order was successfully dispatched.
+   bool Submit(TradeRequest& req, TradeResult& res)
+   {
+      // Populate result defaults
+      res           = TradeResult();
+      res.requestId = req.requestId;
+
+      // Auto-assign requestId if caller left it zero
+      if(req.requestId == 0)
+         req.requestId = res.requestId = ++m_requestCounter;
+
+      m_logger.Debug("ExecEngine",
+         StringFormat("Submit — tag:%s type:%d dir:%d lot:%.2f",
+         req.contextTag, (int)req.orderType, (int)req.direction, req.lotSize));
+
+      string dedupeKey = "";
+      ENUM_REJECTION_REASON reason = RunValidationChain(req, res, dedupeKey);
+      if(reason != REJECT_NONE)
+      {
+         res.success         = false;
+         res.rejectionReason = reason;
+         return false;
+      }
+
+      // Dispatch
+      bool ok = IsMarketOrder(req.orderType)
+                ? DispatchMarketOrder(req, res)
+                : DispatchPendingOrder(req, res);
+
+      if(ok)
+      {
+         // Only successful dispatches enter the registry
+         AddToRegistry(dedupeKey, res.ticket);
+         m_logger.Info("ExecEngine",
+            StringFormat("Filled — tag:%s ticket:%I64u price:%.5f lot:%.2f",
+            req.contextTag, res.ticket, res.executedPrice, res.executedLot));
+      }
+
+      return ok;
+   }
+
+   //--- Called on CLOSE → IDLE transition.
+   //    Wipes registry so the next basket lifecycle starts clean.
+   void ClearRegistry()
+   {
+      m_logger.Info("ExecEngine",
+         StringFormat("ClearRegistry — flushing %d entries.", m_regCount));
+      for(int i = 0; i < m_regCount; i++)
+      {
+         m_regKeys   [i] = "";
+         m_regTickets[i] = 0;
+         m_regTimes  [i] = 0;
+      }
+      m_regCount = 0;
+   }
+
+   int   GetRegistryCount() const { return m_regCount; }
+   ulong GetRegistryTicket(int idx) const
+   {
+      return (idx >= 0 && idx < m_regCount) ? m_regTickets[idx] : 0;
+   }
+};
 
 //══════════════════════════════════════════════════════════════════════
 // SECTION 7 — COrderManager  [Phase 4]
@@ -418,19 +861,22 @@ input double Inp_RSI_OS                = RTE_DEFAULT_RSI_OS;          // Oversol
 input group              "════ Logging ════"
 input ENUM_LOG_LEVEL Inp_LogLevel      = LOG_INFO;                    // Minimum log level to display
 
-//--- Global instances (only CLogger active in Phase 2)
-CLogger* g_logger = NULL;
+//--- Global instances — constructed bottom-up: CLogger first, CRecoveryEngine last
+CLogger*          g_logger    = NULL;
+CRiskGuard*       g_riskGuard = NULL;
+CExecutionEngine* g_execEngine = NULL;
+// Further pointers added per phase
 
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   //--- Logger is always first
+   //--- 1. Logger always first
    g_logger = new CLogger();
    g_logger.SetMinLevel(Inp_LogLevel);
    g_logger.Info("EA", StringFormat("RecoveryTradeEngine v%s starting on %s",
                                      RTE_VERSION_STRING, _Symbol));
 
-   //--- Input validation
+   //--- 2. Input validation
    if(Inp_FastEMA >= Inp_SlowEMA)
    {
       g_logger.Fatal("EA", StringFormat(
@@ -465,7 +911,7 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
 
-   //--- Log validated configuration
+   //--- 3. Log validated configuration
    g_logger.Info("EA", StringFormat(
       "Entry  — FastEMA: %d  SlowEMA: %d",
       Inp_FastEMA, Inp_SlowEMA));
@@ -480,10 +926,21 @@ int OnInit()
       Inp_ADXPeriod, Inp_ADXThreshold, Inp_ATRPeriod,
       Inp_BBPeriod, Inp_BBDeviation, Inp_SMAPeriod));
 
-   //--- Modules will be instantiated here in later phases
-   //    (CRiskGuard, CExecutionEngine, COrderManager, ... CRecoveryEngine)
+   //--- 4. CRiskGuard
+   g_riskGuard = new CRiskGuard(g_logger);
+   g_riskGuard.Init(Inp_MaxSpreadPoints, Inp_MaxLot,
+                    Inp_RiskPercent,     Inp_HardStopUSD);
 
-   g_logger.Info("EA", "Phase 2 skeleton ready — awaiting Phase 3 modules.");
+   //--- 5. CExecutionEngine (depends on CRiskGuard)
+   g_execEngine = new CExecutionEngine(g_riskGuard, g_logger);
+   g_execEngine.Init(RTE_MAGIC_NUMBER, RTE_DEFAULT_SLIPPAGE);
+
+   //--- Phases 4-10: COrderManager, CBasketMonitor, CEntryEngine,
+   //    CRegimeDetector, CTrendRecovery, CRangeRecovery,
+   //    CDashboardViewModel, CDashboardRenderer, CRecoveryEngine
+   //    — instantiated as each phase is implemented.
+
+   g_logger.Info("EA", "Phase 3 ready — RiskGuard + ExecutionEngine online.");
    return INIT_SUCCEEDED;
 }
 
@@ -497,10 +954,12 @@ void OnTick()
 void OnDeinit(const int reason)
 {
    if(g_logger != NULL)
-   {
-      g_logger.Info("EA", StringFormat(
-         "OnDeinit called. Reason: %d", reason));
-      delete g_logger;
-      g_logger = NULL;
-   }
+      g_logger.Info("EA", StringFormat("OnDeinit. Reason: %d", reason));
+
+   //--- Delete in reverse construction order
+   if(g_execEngine != NULL) { delete g_execEngine; g_execEngine = NULL; }
+   if(g_riskGuard  != NULL) { delete g_riskGuard;  g_riskGuard  = NULL; }
+   // Phases 4-10 pointers deleted here as they are added
+
+   if(g_logger != NULL) { delete g_logger; g_logger = NULL; }
 }
