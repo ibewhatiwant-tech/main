@@ -68,6 +68,13 @@ enum ENUM_LOG_LEVEL
    LOG_FATAL = 4
 };
 
+enum ENUM_RECOVERY_MODE
+{
+   RECOVERY_OWN_MAGIC  = 0,  // Only positions opened by this EA (default)
+   RECOVERY_SPEC_MAGIC = 1,  // All positions matching Inp_TargetMagic (external EA/manual)
+   RECOVERY_ALL        = 2   // Every open position regardless of magic
+};
+
 //══════════════════════════════════════════════════════════════════════
 // SECTION 2 — STRUCTS
 //══════════════════════════════════════════════════════════════════════
@@ -993,6 +1000,65 @@ public:
    }
 
    //--- Diff internal registry against live MT5 positions.
+   //--- Scan all broker positions and adopt any that match the magic filter
+   //    but are not yet registered in the basket.
+   //    magicFilter: magic number to match (ignored when matchAll=true)
+   //    matchAll:    adopt positions regardless of magic (RECOVERY_ALL mode)
+   //    Returns: count of newly adopted positions.
+   int ScanBrokerPositions(int magicFilter, bool matchAll)
+   {
+      int newCount = 0;
+      int total    = PositionsTotal();
+
+      for(int i = 0; i < total; i++)
+      {
+         ulong ticket = PositionGetTicket(i);   // Also selects the position
+         if(ticket == 0) continue;
+
+         if(!matchAll)
+         {
+            long posMagic = PositionGetInteger(POSITION_MAGIC);
+            if((int)posMagic != magicFilter) continue;
+         }
+
+         if(FindByTicket(ticket) >= 0) continue;   // Already tracked
+
+         if(m_posCount >= RTE_MAX_BASKET_POSITIONS)
+         {
+            m_logger.Warn("OrderMgr",
+               "ScanBrokerPositions: basket full — skipping remaining.");
+            break;
+         }
+
+         PositionRecord rec;
+         rec.ticket     = ticket;
+         rec.direction  = (ENUM_ORDER_TYPE)PositionGetInteger(POSITION_TYPE);
+         rec.openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+         rec.lotSize    = PositionGetDouble(POSITION_VOLUME);
+         rec.openTime   = (datetime)PositionGetInteger(POSITION_TIME);
+         rec.contextTag = StringFormat("EXT_MAGIC%d",
+                          (int)PositionGetInteger(POSITION_MAGIC));
+         rec.currentPnL = PositionGetDouble(POSITION_PROFIT);
+
+         m_positions[m_posCount++] = rec;
+         newCount++;
+         m_logger.Info("OrderMgr",
+            StringFormat("Adopted — ticket:%I64u  %s  %.2f lot  "
+                         "magic:%d  openPrice:%.5f  [basket:%d]",
+            ticket,
+            (rec.direction == ORDER_TYPE_BUY ? "BUY" : "SELL"),
+            rec.lotSize,
+            (int)PositionGetInteger(POSITION_MAGIC),
+            rec.openPrice,
+            m_posCount));
+      }
+
+      if(newCount > 0)
+         m_logger.Info("OrderMgr",
+            StringFormat("ScanBrokerPositions — adopted %d position(s).", newCount));
+      return newCount;
+   }
+
    //    Removes positions closed externally; refreshes P&L for remaining ones.
    //    Must be called at the start of every MONITOR / RECOVERY tick.
    void ReconcileWithBroker()
@@ -2424,6 +2490,10 @@ private:
    bool               m_entryUseSL;       // Whether to place a hard SL on entry order
    int                m_magic;
 
+   //--- Recovery scope
+   ENUM_RECOVERY_MODE m_recoveryMode;   // Which positions to adopt and recover
+   int                m_targetMagic;    // Used when m_recoveryMode == RECOVERY_SPEC_MAGIC
+
    //--- Tracks the ticket submitted in IDLE so ENTRY can confirm it
    ulong              m_pendingTicket;
 
@@ -2447,11 +2517,35 @@ private:
    }
 
    // ─── IDLE ────────────────────────────────────────────────────────
-   //  Evaluate EMA crossover.  On signal: size lot, build TradeRequest,
-   //  submit via ExecutionEngine, register ticket, move to ENTRY.
+   //  Phase A: Scan for qualifying positions opened outside this EA instance.
+   //    RECOVERY_OWN_MAGIC  — adopts own positions after EA reload / terminal restart
+   //    RECOVERY_SPEC_MAGIC — adopts positions from another EA or manual trades
+   //                          that share Inp_TargetMagic
+   //    RECOVERY_ALL        — adopts every open position; no new entries placed
+   //  Phase B (RECOVERY_OWN_MAGIC only): evaluate EMA crossover and open entry.
 
    void OnIdle()
    {
+      // ── Phase A: adopt qualifying external / reloaded positions ──────
+      {
+         bool matchAll = (m_recoveryMode == RECOVERY_ALL);
+         int  scanMag  = (m_recoveryMode == RECOVERY_SPEC_MAGIC)
+                         ? m_targetMagic
+                         : m_magic;   // OWN_MAGIC scans for the EA's own magic
+         if(m_orderMgr.ScanBrokerPositions(scanMag, matchAll) > 0)
+         {
+            m_logger.Info("RecovEng",
+               "IDLE: existing positions adopted — transitioning to MONITOR.");
+            SetState(STATE_MONITOR);
+            return;
+         }
+      }
+
+      // ── Phase B: EMA entry (disabled in RECOVERY_ALL mode) ───────────
+      // In SPEC_MAGIC / ALL modes the EA acts as a pure recovery engine;
+      // it never opens its own trades.
+      if(m_recoveryMode != RECOVERY_OWN_MAGIC) return;
+
       ENUM_ENTRY_SIGNAL sig = m_entryEngine.Evaluate();
       if(sig == SIGNAL_NONE) return;
 
@@ -2758,7 +2852,9 @@ public:
         m_activeRegime(REGIME_UNDETERMINED),
         m_closeAttempts(0),
         m_detectingTicks(0),
-        m_entryAttempts(0) {}
+        m_entryAttempts(0),
+        m_recoveryMode(RECOVERY_OWN_MAGIC),
+        m_targetMagic(0) {}
 
    void Init(const string symbol, double entryStopPoints,
              bool entryUseSL, int magic)
@@ -2808,6 +2904,17 @@ public:
       m_logger.Info("RecovEng", "CRangeRecovery wired.");
    }
 
+   //--- Configure which positions this engine adopts and recovers.
+   //    Call once from OnInit() after construction.
+   void SetRecoveryMode(ENUM_RECOVERY_MODE mode, int targetMagic)
+   {
+      m_recoveryMode = mode;
+      m_targetMagic  = targetMagic;
+      m_logger.Info("RecovEng",
+         StringFormat("RecoveryMode: %s  TargetMagic: %d",
+         EnumToString(mode), targetMagic));
+   }
+
    ENUM_ENGINE_STATE GetState()   const { return m_state; }
    ENUM_REGIME       GetRegime()  const { return m_activeRegime; }
 };
@@ -2815,6 +2922,15 @@ public:
 //══════════════════════════════════════════════════════════════════════
 // SECTION 16 — INPUT PARAMETERS & EA ENTRY POINTS
 //══════════════════════════════════════════════════════════════════════
+
+//--- Recovery Mode
+input group                    "════ Recovery Mode ════"
+input ENUM_RECOVERY_MODE Inp_RecoveryMode = RECOVERY_OWN_MAGIC;
+                                             // OWN_MAGIC  — manage only positions opened by this EA
+                                             // SPEC_MAGIC — manage positions matching Inp_TargetMagic
+                                             // ALL        — manage every open position (no new entries)
+input int                Inp_TargetMagic  = 0;
+                                             // Magic number to track (used only with SPEC_MAGIC)
 
 //--- Entry
 input group              "════ Entry Settings ════"
@@ -2987,8 +3103,17 @@ int OnInit()
       g_logger.Fatal("EA", "MaxEntryConfirmTicks must be >= 1");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(Inp_RecoveryMode == RECOVERY_SPEC_MAGIC && Inp_TargetMagic == 0)
+   {
+      g_logger.Fatal("EA",
+         "RecoveryMode=SPEC_MAGIC requires a non-zero Inp_TargetMagic");
+      return INIT_PARAMETERS_INCORRECT;
+   }
 
    //--- 3. Log validated configuration
+   g_logger.Info("EA", StringFormat(
+      "RecovMode — %s  TargetMagic: %d",
+      EnumToString(Inp_RecoveryMode), Inp_TargetMagic));
    g_logger.Info("EA", StringFormat(
       "Entry  — FastEMA: %d  SlowEMA: %d",
       Inp_FastEMA, Inp_SlowEMA));
@@ -3066,6 +3191,7 @@ int OnInit()
       g_execEngine, g_orderMgr, g_entryEng,
       g_riskGuard,  g_basketMon, g_logger);
    g_recovEng.Init(_Symbol, Inp_EntryStopPoints, Inp_EntryUseSL, RTE_MAGIC_NUMBER);
+   g_recovEng.SetRecoveryMode(Inp_RecoveryMode, Inp_TargetMagic);
    g_recovEng.SetRegimeDetector(g_regimeDet);
    g_recovEng.SetTrendRecovery(g_trendRec);
    g_recovEng.SetRangeRecovery(g_rangeRec);
