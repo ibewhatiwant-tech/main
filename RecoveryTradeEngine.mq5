@@ -1477,6 +1477,11 @@ private:
    double m_atrRatioThreshold;   // ATR[1] / ATR_average
    int    m_atrAvgBars;          // How many bars for ATR average
 
+   //--- Tiebreaker for 2/4 scores when no prior regime history exists.
+   //    If ADX > m_tiebreakerADX → TREND; otherwise → RANGE.
+   //    Set to 0 to disable (falls back to UNDETERMINED and uses timeout).
+   double m_tiebreakerADX;
+
    ENUM_REGIME m_lastRegime;     // Fallback for UNDETERMINED
 
    // ── Buffer helpers ───────────────────────────────────────────────
@@ -1562,6 +1567,7 @@ public:
         m_bbWidthThreshold(RTE_DEFAULT_BB_WIDTH),
         m_atrRatioThreshold(RTE_DEFAULT_ATR_RATIO),
         m_atrAvgBars(RTE_DEFAULT_ATR_AVG_BARS),
+        m_tiebreakerADX(30.0),
         m_lastRegime(REGIME_UNDETERMINED) {}
 
    //--- Creates all four indicator handles.  Returns false on any failure.
@@ -1569,7 +1575,8 @@ public:
              int adxPeriod,  double adxThreshold,
              int smaPeriod,  double slopePtsThreshold,
              int bbPeriod,   double bbDeviation,  double bbWidthThreshold,
-             int atrPeriod,  double atrRatioThreshold)
+             int atrPeriod,  double atrRatioThreshold,
+             double tiebreakerADX = 30.0)
    {
       m_symbol             = symbol;
       m_timeframe          = tf;
@@ -1577,6 +1584,7 @@ public:
       m_slopePtsThreshold  = slopePtsThreshold;
       m_bbWidthThreshold   = bbWidthThreshold;
       m_atrRatioThreshold  = atrRatioThreshold;
+      m_tiebreakerADX      = tiebreakerADX;
 
       m_handleADX = iADX  (symbol, tf, adxPeriod);
       m_handleSMA = iMA   (symbol, tf, smaPeriod, 0, MODE_SMA, PRICE_CLOSE);
@@ -1617,10 +1625,29 @@ public:
       else if(score.trendPoints <= 1) score.classification = REGIME_RANGE;
       else
       {
-         //--- Tie (2/4): fall back to last known regime to avoid flip-flopping
-         score.classification = (m_lastRegime != REGIME_UNDETERMINED)
-                                 ? m_lastRegime
-                                 : REGIME_UNDETERMINED;
+         // Tie (2/4): resolution priority —
+         //  1. Hysteresis: use last confirmed regime to avoid flip-flopping.
+         //  2. ADX tiebreaker: if no history, compare raw ADX to threshold.
+         //     ADX > tiebreakerADX → TREND; ≤ → RANGE.
+         //     (Set Inp_TiebreakerADX = 0 to disable and keep UNDETERMINED.)
+         if(m_lastRegime != REGIME_UNDETERMINED)
+         {
+            score.classification = m_lastRegime;
+         }
+         else if(m_tiebreakerADX > 0.0)
+         {
+            score.classification = (score.adxValue > m_tiebreakerADX)
+                                    ? REGIME_TREND
+                                    : REGIME_RANGE;
+            m_logger.Info("RegimeDet",
+               StringFormat("Tiebreak via ADX — adx=%.1f  threshold=%.1f → %s",
+               score.adxValue, m_tiebreakerADX,
+               EnumToString(score.classification)));
+         }
+         else
+         {
+            score.classification = REGIME_UNDETERMINED;
+         }
       }
 
       if(score.classification != REGIME_UNDETERMINED)
@@ -2973,6 +3000,7 @@ input double Inp_BBDeviation           = RTE_DEFAULT_BB_DEVIATION;
 input double Inp_BBWidthThreshold      = RTE_DEFAULT_BB_WIDTH;        // Min (upper-lower)/middle
 input int    Inp_ATRPeriod             = RTE_DEFAULT_ATR_PERIOD;
 input double Inp_ATRRatioThreshold     = RTE_DEFAULT_ATR_RATIO;       // Min ATR/ATR-avg ratio
+input double Inp_TiebreakerADX        = 30.0;    // 2/4 tiebreak: ADX > this → TREND; ≤ → RANGE (0 = disable)
 
 //--- Trend Recovery
 input group              "════ Trend Recovery ════"
@@ -3160,7 +3188,8 @@ int OnInit()
                         Inp_ADXPeriod,   Inp_ADXThreshold,
                         Inp_SMAPeriod,   Inp_SlopePtsThreshold,
                         Inp_BBPeriod,    Inp_BBDeviation, Inp_BBWidthThreshold,
-                        Inp_ATRPeriod,   Inp_ATRRatioThreshold))
+                        Inp_ATRPeriod,   Inp_ATRRatioThreshold,
+                        Inp_TiebreakerADX))
       return INIT_FAILED;
 
    //--- 10. CTrendRecovery (depends on CExecutionEngine + CRiskGuard)
