@@ -2532,6 +2532,11 @@ private:
    int                m_detectingTicks;   // Ticks spent in STATE_DETECTING with REGIME_UNDETERMINED
    int                m_entryAttempts;    // Ticks spent in STATE_ENTRY waiting for position confirmation
 
+   //--- Configurable limits (set via SetLimits; defaults match input defaults)
+   int                m_maxEntryConfirmTicks;  // Abort entry after this many unconfirmed ticks
+   int                m_maxDetectingTicks;     // Force CLOSE after this many undetermined-regime ticks
+   int                m_maxCloseAttempts;      // Force cycle reset after this many failed close ticks
+
    // ─── State transition helper ─────────────────────────────────────
 
    void SetState(ENUM_ENGINE_STATE next)
@@ -2639,14 +2644,14 @@ private:
       m_entryAttempts++;
       m_logger.Warn("RecovEng",
          StringFormat("ENTRY: position not confirmed — attempt %d/%d  ticket:%I64u",
-         m_entryAttempts, Inp_MaxEntryConfirmTicks, m_pendingTicket));
+         m_entryAttempts, m_maxEntryConfirmTicks, m_pendingTicket));
 
-      if(m_entryAttempts >= Inp_MaxEntryConfirmTicks)
+      if(m_entryAttempts >= m_maxEntryConfirmTicks)
       {
          m_logger.Fatal("RecovEng",
             StringFormat("ENTRY: position ticket:%I64u unconfirmed after %d ticks — "
                          "aborting. Check broker manually.",
-            m_pendingTicket, Inp_MaxEntryConfirmTicks));
+            m_pendingTicket, m_maxEntryConfirmTicks));
          Alert(StringFormat("RecoveryTradeEngine: entry ticket %I64u not confirmed on %s.",
                m_pendingTicket, m_symbol));
          m_pendingTicket = 0;
@@ -2726,13 +2731,13 @@ private:
          m_detectingTicks++;
          m_logger.Warn("RecovEng",
             StringFormat("DETECTING: regime undetermined (score 2/4) — tick %d/%d.",
-            m_detectingTicks, Inp_MaxDetectingTicks));
+            m_detectingTicks, m_maxDetectingTicks));
 
-         if(m_detectingTicks >= Inp_MaxDetectingTicks)
+         if(m_detectingTicks >= m_maxDetectingTicks)
          {
             m_logger.Fatal("RecovEng",
                StringFormat("DETECTING: regime still undetermined after %d ticks — "
-                            "forcing CLOSE to protect basket.", Inp_MaxDetectingTicks));
+                            "forcing CLOSE to protect basket.", m_maxDetectingTicks));
             SetState(STATE_CLOSE);
          }
          return;   // Stay in DETECTING (or just transitioned to CLOSE)
@@ -2822,15 +2827,15 @@ private:
       m_closeAttempts++;
       m_logger.Warn("RecovEng",
          StringFormat("CLOSE: %d position(s) still open — attempt %d/%d.",
-         m_orderMgr.GetPositionCount(), m_closeAttempts, Inp_MaxCloseAttempts));
+         m_orderMgr.GetPositionCount(), m_closeAttempts, m_maxCloseAttempts));
 
-      if(m_closeAttempts >= Inp_MaxCloseAttempts)
+      if(m_closeAttempts >= m_maxCloseAttempts)
       {
          m_logger.Fatal("RecovEng",
             StringFormat("CLOSE: max close attempts (%d) reached — forcing cycle reset. "
-                         "Manual position check required!", Inp_MaxCloseAttempts));
+                         "Manual position check required!", m_maxCloseAttempts));
          Alert(StringFormat("RecoveryTradeEngine: CloseAll failed after %d attempts on %s. "
-                            "Check open positions manually.", Inp_MaxCloseAttempts, m_symbol));
+                            "Check open positions manually.", m_maxCloseAttempts, m_symbol));
          ResetCycle();
          SetState(STATE_IDLE);
       }
@@ -2881,7 +2886,10 @@ public:
         m_detectingTicks(0),
         m_entryAttempts(0),
         m_recoveryMode(RECOVERY_OWN_MAGIC),
-        m_targetMagic(0) {}
+        m_targetMagic(0),
+        m_maxEntryConfirmTicks(3),
+        m_maxDetectingTicks(20),
+        m_maxCloseAttempts(10) {}
 
    void Init(const string symbol, double entryStopPoints,
              bool entryUseSL, int magic)
@@ -2940,6 +2948,17 @@ public:
       m_logger.Info("RecovEng",
          StringFormat("RecoveryMode: %s  TargetMagic: %d",
          EnumToString(mode), targetMagic));
+   }
+
+   //--- Override tick-based limits (called from OnInit after construction)
+   void SetLimits(int maxEntryConfirmTicks, int maxDetectingTicks, int maxCloseAttempts)
+   {
+      m_maxEntryConfirmTicks = (maxEntryConfirmTicks >= 1) ? maxEntryConfirmTicks : 3;
+      m_maxDetectingTicks    = (maxDetectingTicks    >= 1) ? maxDetectingTicks    : 20;
+      m_maxCloseAttempts     = (maxCloseAttempts     >= 1) ? maxCloseAttempts     : 10;
+      m_logger.Info("RecovEng",
+         StringFormat("Limits — entryConfirm:%d  detecting:%d  closeAttempts:%d",
+         m_maxEntryConfirmTicks, m_maxDetectingTicks, m_maxCloseAttempts));
    }
 
    ENUM_ENGINE_STATE GetState()   const { return m_state; }
@@ -3221,6 +3240,7 @@ int OnInit()
       g_riskGuard,  g_basketMon, g_logger);
    g_recovEng.Init(_Symbol, Inp_EntryStopPoints, Inp_EntryUseSL, RTE_MAGIC_NUMBER);
    g_recovEng.SetRecoveryMode(Inp_RecoveryMode, Inp_TargetMagic);
+   g_recovEng.SetLimits(Inp_MaxEntryConfirmTicks, Inp_MaxDetectingTicks, Inp_MaxCloseAttempts);
    g_recovEng.SetRegimeDetector(g_regimeDet);
    g_recovEng.SetTrendRecovery(g_trendRec);
    g_recovEng.SetRangeRecovery(g_rangeRec);
