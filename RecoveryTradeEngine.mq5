@@ -698,14 +698,16 @@ public:
         m_requestCounter(0) {}
 
    //--- Called from OnInit() after CTrade parameters are known
-   void Init(int magicNumber, int slippagePoints)
+   void Init(int magicNumber, int slippagePoints,
+             ENUM_ORDER_TYPE_FILLING fillingMode = ORDER_FILLING_FOK)
    {
       m_trade.SetExpertMagicNumber(magicNumber);
       m_trade.SetDeviationInPoints(slippagePoints);
-      m_trade.SetTypeFilling(ORDER_FILLING_FOK);   // Adjust per broker if needed
+      m_trade.SetTypeFilling(fillingMode);
       m_trade.LogLevel(LOG_LEVEL_ERRORS);          // Internal CTrade logging
       m_logger.Info("ExecEngine",
-         StringFormat("Init — magic:%d slippage:%d pts", magicNumber, slippagePoints));
+         StringFormat("Init — magic:%d slippage:%d pts filling:%s",
+         magicNumber, slippagePoints, EnumToString(fillingMode)));
    }
 
    //--- Primary public interface.  All modules call ONLY this method.
@@ -1157,6 +1159,34 @@ private:
    string           m_symbol;
    ENUM_TIMEFRAMES  m_timeframe;
 
+   //--- Session filter (0/0 = disabled)
+   int              m_sessionStartHour;
+   int              m_sessionEndHour;
+   bool             m_blockSundayRollover;
+
+   //--- Returns true when server time is within the configured trading window.
+   //    Passes-through when start==end==0 (filter disabled).
+   bool IsWithinSession() const
+   {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+
+      // Block Sunday rollover window (17:00–18:00 server time, day-of-week 0 = Sunday)
+      if(m_blockSundayRollover && dt.day_of_week == 0 &&
+         dt.hour >= 17 && dt.hour < 18)
+         return false;
+
+      // Pass-through when session filter is disabled
+      if(m_sessionStartHour == 0 && m_sessionEndHour == 0)
+         return true;
+
+      // Wrap-around sessions (e.g. 22:00–06:00) handled via OR
+      if(m_sessionStartHour < m_sessionEndHour)
+         return (dt.hour >= m_sessionStartHour && dt.hour < m_sessionEndHour);
+      else
+         return (dt.hour >= m_sessionStartHour || dt.hour < m_sessionEndHour);
+   }
+
    //--- Read 3 values from a handle into a time-series buffer.
    //    buf[0] = bar 0 (forming), buf[1] = bar 1 (last closed),
    //    buf[2] = bar 2 (prior closed).
@@ -1175,7 +1205,21 @@ public:
         m_fastPeriod(RTE_DEFAULT_FAST_EMA),
         m_slowPeriod(RTE_DEFAULT_SLOW_EMA),
         m_symbol(""),
-        m_timeframe(PERIOD_CURRENT) {}
+        m_timeframe(PERIOD_CURRENT),
+        m_sessionStartHour(0),
+        m_sessionEndHour(0),
+        m_blockSundayRollover(true) {}
+
+   //--- Configure trading-hours filter.  Call before first OnTick().
+   void SetSessionFilter(int startHour, int endHour, bool blockSunday)
+   {
+      m_sessionStartHour   = startHour;
+      m_sessionEndHour     = endHour;
+      m_blockSundayRollover = blockSunday;
+      m_logger.Info("EntryEng",
+         StringFormat("SessionFilter — start:%02d:00  end:%02d:00  blockSunday:%s",
+         startHour, endHour, (blockSunday ? "true" : "false")));
+   }
 
    //--- Creates indicator handles.  Returns false on failure.
    bool Init(const string symbol, ENUM_TIMEFRAMES tf,
@@ -1209,6 +1253,9 @@ public:
    ENUM_ENTRY_SIGNAL Evaluate() const
    {
       if(m_handleFast == INVALID_HANDLE || m_handleSlow == INVALID_HANDLE)
+         return SIGNAL_NONE;
+
+      if(!IsWithinSession())
          return SIGNAL_NONE;
 
       double fastBuf[3], slowBuf[3];
@@ -1844,13 +1891,22 @@ private:
 
       double lot = ClampLot(snap.totalLots * m_lotRatio);
 
+      // Fallback SL: 50% of range size away from entry (caps unchecked adverse move)
+      double sl;
+      if(dir == ORDER_TYPE_SELL)
+         sl = NormalizeDouble(
+              MathRound((entryPrice + rangeSize * 0.5) / tickSize) * tickSize, digits);
+      else
+         sl = NormalizeDouble(
+              MathRound((entryPrice - rangeSize * 0.5) / tickSize) * tickSize, digits);
+
       TradeRequest req;
       req.symbol         = m_symbol;
       req.direction      = dir;
       req.orderType      = dir;
       req.lotSize        = lot;
       req.takeProfit     = tp;
-      req.stopLoss       = 0.0;   // Hard stop handles worst-case
+      req.stopLoss       = sl;
       req.isLotValidated = true;
       req.contextTag     = "HEDGE_RANGE";
       req.magicNumber    = RTE_MAGIC_NUMBER;
@@ -2259,6 +2315,10 @@ private:
    //--- Regime selected in DETECTING, consumed by RECOVERY (Phases 6/7)
    ENUM_REGIME        m_activeRegime;
 
+   //--- Counters reset per basket cycle
+   int                m_closeAttempts;    // Ticks spent in STATE_CLOSE with positions still open
+   int                m_detectingTicks;   // Ticks spent in STATE_DETECTING with REGIME_UNDETERMINED
+
    // ─── State transition helper ─────────────────────────────────────
 
    void SetState(ENUM_ENGINE_STATE next)
@@ -2406,9 +2466,19 @@ private:
 
       if(score.classification == REGIME_UNDETERMINED)
       {
+         m_detectingTicks++;
          m_logger.Warn("RecovEng",
-            "DETECTING: regime undetermined (score 2/4) — retrying next tick.");
-         return;   // Stay in DETECTING
+            StringFormat("DETECTING: regime undetermined (score 2/4) — tick %d/%d.",
+            m_detectingTicks, Inp_MaxDetectingTicks));
+
+         if(m_detectingTicks >= Inp_MaxDetectingTicks)
+         {
+            m_logger.Fatal("RecovEng",
+               StringFormat("DETECTING: regime still undetermined after %d ticks — "
+                            "forcing CLOSE to protect basket.", Inp_MaxDetectingTicks));
+            SetState(STATE_CLOSE);
+         }
+         return;   // Stay in DETECTING (or just transitioned to CLOSE)
       }
 
       m_activeRegime = score.classification;
@@ -2488,12 +2558,23 @@ private:
          m_logger.Info("RecovEng", "CLOSE: all positions confirmed closed.");
          ResetCycle();
          SetState(STATE_IDLE);
+         return;
       }
-      else
+
+      m_closeAttempts++;
+      m_logger.Warn("RecovEng",
+         StringFormat("CLOSE: %d position(s) still open — attempt %d/%d.",
+         m_orderMgr.GetPositionCount(), m_closeAttempts, Inp_MaxCloseAttempts));
+
+      if(m_closeAttempts >= Inp_MaxCloseAttempts)
       {
-         m_logger.Warn("RecovEng",
-            StringFormat("CLOSE: %d position(s) still open — retrying next tick.",
-            m_orderMgr.GetPositionCount()));
+         m_logger.Fatal("RecovEng",
+            StringFormat("CLOSE: max close attempts (%d) reached — forcing cycle reset. "
+                         "Manual position check required!", Inp_MaxCloseAttempts));
+         Alert(StringFormat("RecoveryTradeEngine: CloseAll failed after %d attempts on %s. "
+                            "Check open positions manually.", Inp_MaxCloseAttempts, m_symbol));
+         ResetCycle();
+         SetState(STATE_IDLE);
       }
    }
 
@@ -2507,8 +2588,10 @@ private:
       m_riskGuard.ClearHardStop();
       if(m_trendRecovery != NULL) m_trendRecovery.Reset();
       if(m_rangeRecovery != NULL) m_rangeRecovery.Reset();
-      m_pendingTicket = 0;
-      m_activeRegime  = REGIME_UNDETERMINED;
+      m_pendingTicket  = 0;
+      m_activeRegime   = REGIME_UNDETERMINED;
+      m_closeAttempts  = 0;
+      m_detectingTicks = 0;
       m_logger.Info("RecovEng", "Basket cycle reset complete.");
    }
 
@@ -2534,7 +2617,9 @@ public:
         m_entryUseSL(false),
         m_magic(RTE_MAGIC_NUMBER),
         m_pendingTicket(0),
-        m_activeRegime(REGIME_UNDETERMINED) {}
+        m_activeRegime(REGIME_UNDETERMINED),
+        m_closeAttempts(0),
+        m_detectingTicks(0) {}
 
    void Init(const string symbol, double entryStopPoints,
              bool entryUseSL, int magic)
@@ -2600,16 +2685,25 @@ input ENUM_TIMEFRAMES  Inp_Timeframe       = PERIOD_CURRENT;          // EMA tim
 input int              Inp_EntryStopPoints = 200;                     // Stop distance (points) for lot sizing
 input bool             Inp_EntryUseSL      = false;                   // Place hard SL on entry order
 
+//--- Session Filter
+input group              "════ Session Filter ════"
+input int              Inp_SessionStartHour    = 0;     // Trading session start (server hour, 0=disabled)
+input int              Inp_SessionEndHour      = 0;     // Trading session end   (server hour, 0=disabled)
+input bool             Inp_BlockSundayRollover = true;  // Block entries 17:00–18:00 Sunday (server time)
+
 //--- Recovery
 input group              "════ Recovery Settings ════"
 input double Inp_RecoveryActivationUSD = RTE_DEFAULT_RECOVERY_USD;    // USD drawdown to trigger recovery
 input double Inp_HardStopUSD           = RTE_DEFAULT_HARD_STOP_USD;   // USD loss → force close all
+input int    Inp_MaxCloseAttempts      = 10;                          // Ticks in STATE_CLOSE before forced reset + alert
+input int    Inp_MaxDetectingTicks     = 20;                          // Ticks in STATE_DETECTING before forcing CLOSE
 
 //--- Risk
 input group              "════ Risk Settings ════"
 input double Inp_RiskPercent           = RTE_DEFAULT_RISK_PERCENT;    // % of balance per trade
 input double Inp_MaxLot                = RTE_DEFAULT_MAX_LOT;         // Hard lot cap
 input double Inp_MaxSpreadPoints       = RTE_DEFAULT_MAX_SPREAD;      // Max spread in points
+input ENUM_ORDER_TYPE_FILLING Inp_FillingMode = ORDER_FILLING_FOK;    // Order filling mode (FOK/IOC/Return)
 
 //--- Regime Detection
 input group              "════ Regime Detection ════"
@@ -2755,7 +2849,7 @@ int OnInit()
 
    //--- 5. CExecutionEngine (depends on CRiskGuard)
    g_execEngine = new CExecutionEngine(g_riskGuard, g_logger);
-   g_execEngine.Init(RTE_MAGIC_NUMBER, RTE_DEFAULT_SLIPPAGE);
+   g_execEngine.Init(RTE_MAGIC_NUMBER, RTE_DEFAULT_SLIPPAGE, Inp_FillingMode);
 
    //--- 6. COrderManager (depends on CExecutionEngine)
    g_orderMgr = new COrderManager(g_execEngine, g_logger);
@@ -2769,6 +2863,8 @@ int OnInit()
    g_entryEng = new CEntryEngine(g_logger);
    if(!g_entryEng.Init(_Symbol, Inp_Timeframe, Inp_FastEMA, Inp_SlowEMA))
       return INIT_FAILED;
+   g_entryEng.SetSessionFilter(Inp_SessionStartHour, Inp_SessionEndHour,
+                                Inp_BlockSundayRollover);
 
    //--- 9. CRegimeDetector
    g_regimeDet = new CRegimeDetector(g_logger);
