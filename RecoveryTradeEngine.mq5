@@ -766,19 +766,334 @@ public:
    {
       return (idx >= 0 && idx < m_regCount) ? m_regTickets[idx] : 0;
    }
+
+   //--- Close an existing position by ticket.
+   //    Closes bypass the dedupe registry — reduces risk, always allowed.
+   //    Hard stop does NOT block closes (we need to exit, not enter).
+   bool SubmitClose(ulong ticket, const string contextTag, TradeResult& res)
+   {
+      res           = TradeResult();
+      res.requestId = ++m_requestCounter;
+
+      if(ticket == 0)
+      {
+         m_logger.Error("ExecEngine", "SubmitClose: invalid ticket 0 tag:" + contextTag);
+         res.rejectionReason = REJECT_BROKER_REJECT;
+         return false;
+      }
+
+      m_logger.Debug("ExecEngine",
+         StringFormat("SubmitClose — ticket:%I64u tag:%s", ticket, contextTag));
+
+      bool ok = m_trade.PositionClose(ticket);
+
+      uint retcode = m_trade.ResultRetcode();
+      if(ok && retcode == TRADE_RETCODE_DONE)
+      {
+         res.ticket  = ticket;
+         res.success = true;
+         m_logger.Info("ExecEngine",
+            StringFormat("Closed — ticket:%I64u tag:%s", ticket, contextTag));
+         return true;
+      }
+
+      res.errorCode       = (int)retcode;
+      res.rejectionReason = REJECT_BROKER_REJECT;
+      m_logger.Error("ExecEngine",
+         StringFormat("Close failed — ticket:%I64u retcode:%u tag:%s",
+         ticket, retcode, contextTag));
+      return false;
+   }
 };
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 7 — COrderManager  [Phase 4]
+// SECTION 7 — COrderManager
+//  Responsibilities:
+//    • Authoritative registry of every basket position (PositionRecord[])
+//    • Reconcile against MT5 live positions each tick
+//    • Compute basket-level aggregates (BasketSnapshot)
+//    • Close all tracked positions via CExecutionEngine::SubmitClose()
+//    • Reset for next basket lifecycle
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 4
+class COrderManager
+{
+private:
+   CExecutionEngine*  m_execEngine;
+   CLogger*           m_logger;
+   int                m_magic;
+
+   PositionRecord     m_positions[RTE_MAX_BASKET_POSITIONS];
+   int                m_posCount;
+
+   //--- Linear search by ticket; returns index or -1
+   int FindByTicket(ulong ticket) const
+   {
+      for(int i = 0; i < m_posCount; i++)
+         if(m_positions[i].ticket == ticket) return i;
+      return -1;
+   }
+
+   //--- Remove entry at index by shifting array left
+   void RemoveAt(int idx)
+   {
+      for(int i = idx; i < m_posCount - 1; i++)
+         m_positions[i] = m_positions[i + 1];
+      m_posCount--;
+   }
+
+public:
+   COrderManager(CExecutionEngine* exec, CLogger* logger)
+      : m_execEngine(exec), m_logger(logger), m_magic(0), m_posCount(0) {}
+
+   void Init(int magic)
+   {
+      m_magic = magic;
+      m_logger.Info("OrderMgr", StringFormat("Init — magic:%d", magic));
+   }
+
+   //--- Called by CRecoveryEngine immediately after CExecutionEngine::Submit() succeeds.
+   //    Reads live position data from MT5 and stores in registry.
+   void RegisterTicket(ulong ticket, const string contextTag)
+   {
+      if(m_posCount >= RTE_MAX_BASKET_POSITIONS)
+      {
+         m_logger.Error("OrderMgr",
+            StringFormat("Registry full (%d). Cannot register ticket:%I64u",
+            RTE_MAX_BASKET_POSITIONS, ticket));
+         return;
+      }
+      if(FindByTicket(ticket) >= 0)
+      {
+         m_logger.Warn("OrderMgr",
+            StringFormat("Ticket %I64u already registered.", ticket));
+         return;
+      }
+      if(!PositionSelectByTicket(ticket))
+      {
+         m_logger.Error("OrderMgr",
+            StringFormat("PositionSelectByTicket failed for %I64u tag:%s",
+            ticket, contextTag));
+         return;
+      }
+
+      PositionRecord rec;
+      rec.ticket     = ticket;
+      rec.direction  = (ENUM_ORDER_TYPE)PositionGetInteger(POSITION_TYPE);
+      rec.openPrice  = PositionGetDouble(POSITION_OPEN_PRICE);
+      rec.lotSize    = PositionGetDouble(POSITION_VOLUME);
+      rec.openTime   = (datetime)PositionGetInteger(POSITION_TIME);
+      rec.contextTag = contextTag;
+      rec.currentPnL = PositionGetDouble(POSITION_PROFIT);
+
+      m_positions[m_posCount++] = rec;
+      m_logger.Info("OrderMgr",
+         StringFormat("Registered ticket:%I64u dir:%s lot:%.2f tag:%s  [basket size:%d]",
+         ticket,
+         (rec.direction == ORDER_TYPE_BUY ? "BUY" : "SELL"),
+         rec.lotSize, contextTag, m_posCount));
+   }
+
+   //--- Diff internal registry against live MT5 positions.
+   //    Removes positions closed externally; refreshes P&L for remaining ones.
+   //    Must be called at the start of every MONITOR / RECOVERY tick.
+   void ReconcileWithBroker()
+   {
+      int i = 0;
+      while(i < m_posCount)
+      {
+         if(!PositionSelectByTicket(m_positions[i].ticket))
+         {
+            // Position no longer exists — closed externally or by broker
+            m_logger.Warn("OrderMgr",
+               StringFormat("Ticket %I64u gone (external close). Removing from basket.",
+               m_positions[i].ticket));
+            RemoveAt(i);
+            // Do not advance i — recheck the slot that just shifted into place
+         }
+         else
+         {
+            m_positions[i].currentPnL = PositionGetDouble(POSITION_PROFIT);
+            i++;
+         }
+      }
+   }
+
+   //--- Aggregate all basket positions into a flat snapshot struct.
+   BasketSnapshot GetBasketSnapshot() const
+   {
+      BasketSnapshot snap;
+      snap.snapshotTime = TimeCurrent();
+
+      double buyLots  = 0.0;
+      double sellLots = 0.0;
+
+      for(int i = 0; i < m_posCount; i++)
+      {
+         snap.positionCount++;
+         snap.totalLots += m_positions[i].lotSize;
+         snap.netPnlUSD += m_positions[i].currentPnL;
+
+         if(m_positions[i].direction == ORDER_TYPE_BUY)
+            buyLots  += m_positions[i].lotSize;
+         else
+            sellLots += m_positions[i].lotSize;
+
+         if(snap.oldestOpenTime == 0 ||
+            m_positions[i].openTime < snap.oldestOpenTime)
+            snap.oldestOpenTime = m_positions[i].openTime;
+      }
+
+      if     (buyLots  > sellLots) snap.netDirection =  1;
+      else if(sellLots > buyLots)  snap.netDirection = -1;
+      else                          snap.netDirection =  0;
+
+      return snap;
+   }
+
+   //--- Submit a close request for every registered position.
+   //    Partial failures are logged; caller (CRecoveryEngine in CLOSE state)
+   //    should call ReconcileWithBroker() afterwards to confirm.
+   void CloseAll()
+   {
+      m_logger.Info("OrderMgr",
+         StringFormat("CloseAll — closing %d position(s).", m_posCount));
+
+      // Iterate over a snapshot of tickets since ReconcileWithBroker
+      // may alter m_posCount during the loop
+      ulong tickets[RTE_MAX_BASKET_POSITIONS];
+      string tags  [RTE_MAX_BASKET_POSITIONS];
+      int    count = m_posCount;
+      for(int i = 0; i < count; i++)
+      {
+         tickets[i] = m_positions[i].ticket;
+         tags[i]    = m_positions[i].contextTag;
+      }
+
+      for(int i = 0; i < count; i++)
+      {
+         TradeResult res;
+         string closeTag = StringFormat("CLOSE_%I64u", tickets[i]);
+         if(!m_execEngine.SubmitClose(tickets[i], closeTag, res))
+         {
+            m_logger.Error("OrderMgr",
+               StringFormat("CloseAll: failed to close ticket:%I64u — retcode:%d",
+               tickets[i], res.errorCode));
+         }
+      }
+   }
+
+   //--- Reset internal state for a new basket lifecycle.
+   //    Call after all positions are confirmed closed (CLOSE→IDLE).
+   void Reset()
+   {
+      m_logger.Info("OrderMgr",
+         StringFormat("Reset — clearing %d record(s).", m_posCount));
+      for(int i = 0; i < m_posCount; i++)
+         m_positions[i] = PositionRecord();
+      m_posCount = 0;
+   }
+
+   int  GetPositionCount() const { return m_posCount; }
+   bool HasOpenPositions()  const { return m_posCount > 0; }
+
+   //--- Read-only access to a specific record (used by recovery modules)
+   bool GetRecord(int idx, PositionRecord& rec) const
+   {
+      if(idx < 0 || idx >= m_posCount) return false;
+      rec = m_positions[idx];
+      return true;
+   }
+};
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 8 — CBasketMonitor  [Phase 4]
+// SECTION 8 — CBasketMonitor
+//  Responsibilities:
+//    • Receive a BasketSnapshot, compute ENUM_BASKET_STATUS
+//    • Signal RECOVERY_TRIGGER when P_net < 0 AND
+//      abs(P_net) >= RecoveryActivationUSD
+//    • Feed basket P&L to CRiskGuard for hard stop evaluation
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 4
+class CBasketMonitor
+{
+private:
+   CLogger*    m_logger;
+   CRiskGuard* m_riskGuard;
+   double      m_recoveryActivationUSD;
+
+   //--- Threshold hysteresis: once RECOVERY_TRIGGER fires we stay in that
+   //    state until the basket recovers past zero, preventing rapid toggling
+   //    back and forth when P&L hovers near the threshold.
+   bool        m_triggerLatched;
+
+public:
+   CBasketMonitor(CRiskGuard* riskGuard, CLogger* logger)
+      : m_riskGuard(riskGuard),
+        m_logger(logger),
+        m_recoveryActivationUSD(RTE_DEFAULT_RECOVERY_USD),
+        m_triggerLatched(false) {}
+
+   void Init(double recoveryActivationUSD)
+   {
+      m_recoveryActivationUSD = recoveryActivationUSD;
+      m_logger.Info("BasketMon",
+         StringFormat("Init — RecoveryActivationUSD: %.2f", recoveryActivationUSD));
+   }
+
+   //--- Primary evaluation called every MONITOR state tick.
+   //    Also drives CRiskGuard hard stop check as a side effect.
+   ENUM_BASKET_STATUS Evaluate(const BasketSnapshot& snap)
+   {
+      double pnl = snap.netPnlUSD;
+
+      // Always feed current P&L to the hard stop guard
+      m_riskGuard.CheckAndSetHardStop(pnl);
+
+      // Healthy — basket is flat or profitable
+      if(pnl >= 0.0)
+      {
+         if(m_triggerLatched)
+         {
+            m_logger.Info("BasketMon",
+               StringFormat("Basket recovered to +%.2f USD — latch cleared.", pnl));
+            m_triggerLatched = false;
+         }
+         return BASKET_HEALTHY;
+      }
+
+      double loss = MathAbs(pnl);
+
+      // Recovery trigger: loss has reached the configured activation threshold
+      if(loss >= m_recoveryActivationUSD)
+      {
+         if(!m_triggerLatched)
+         {
+            m_triggerLatched = true;
+            m_logger.Warn("BasketMon",
+               StringFormat("RECOVERY_TRIGGER — P&L: %.2f USD  threshold: %.2f USD  positions: %d",
+               pnl, m_recoveryActivationUSD, snap.positionCount));
+         }
+         return BASKET_RECOVERY_TRIGGER;
+      }
+
+      // Minor drawdown — below threshold, no action yet
+      m_logger.Debug("BasketMon",
+         StringFormat("Minor drawdown — P&L: %.2f USD  (threshold: %.2f)",
+         pnl, m_recoveryActivationUSD));
+      return BASKET_DRAWDOWN_MINOR;
+   }
+
+   //--- Reset latch on CLOSE→IDLE so the next basket cycle starts fresh
+   void Reset()
+   {
+      m_triggerLatched = false;
+      m_logger.Debug("BasketMon", "Trigger latch reset for new basket cycle.");
+   }
+
+   bool IsTriggered()              const { return m_triggerLatched; }
+   double GetActivationUSD()       const { return m_recoveryActivationUSD; }
+};
 
 //══════════════════════════════════════════════════════════════════════
 // SECTION 9 — CEntryEngine  [Phase 5]
@@ -862,9 +1177,11 @@ input group              "════ Logging ════"
 input ENUM_LOG_LEVEL Inp_LogLevel      = LOG_INFO;                    // Minimum log level to display
 
 //--- Global instances — constructed bottom-up: CLogger first, CRecoveryEngine last
-CLogger*          g_logger    = NULL;
-CRiskGuard*       g_riskGuard = NULL;
-CExecutionEngine* g_execEngine = NULL;
+CLogger*          g_logger      = NULL;
+CRiskGuard*       g_riskGuard   = NULL;
+CExecutionEngine* g_execEngine  = NULL;
+COrderManager*    g_orderMgr    = NULL;
+CBasketMonitor*   g_basketMon   = NULL;
 // Further pointers added per phase
 
 //+------------------------------------------------------------------+
@@ -935,12 +1252,19 @@ int OnInit()
    g_execEngine = new CExecutionEngine(g_riskGuard, g_logger);
    g_execEngine.Init(RTE_MAGIC_NUMBER, RTE_DEFAULT_SLIPPAGE);
 
-   //--- Phases 4-10: COrderManager, CBasketMonitor, CEntryEngine,
-   //    CRegimeDetector, CTrendRecovery, CRangeRecovery,
-   //    CDashboardViewModel, CDashboardRenderer, CRecoveryEngine
-   //    — instantiated as each phase is implemented.
+   //--- 6. COrderManager (depends on CExecutionEngine)
+   g_orderMgr = new COrderManager(g_execEngine, g_logger);
+   g_orderMgr.Init(RTE_MAGIC_NUMBER);
 
-   g_logger.Info("EA", "Phase 3 ready — RiskGuard + ExecutionEngine online.");
+   //--- 7. CBasketMonitor (depends on CRiskGuard)
+   g_basketMon = new CBasketMonitor(g_riskGuard, g_logger);
+   g_basketMon.Init(Inp_RecoveryActivationUSD);
+
+   //--- Phases 5-10: CEntryEngine, CRegimeDetector, CTrendRecovery,
+   //    CRangeRecovery, CDashboardViewModel, CDashboardRenderer,
+   //    CRecoveryEngine — instantiated as each phase is implemented.
+
+   g_logger.Info("EA", "Phase 4 ready — OrderManager + BasketMonitor online.");
    return INIT_SUCCEEDED;
 }
 
@@ -957,9 +1281,11 @@ void OnDeinit(const int reason)
       g_logger.Info("EA", StringFormat("OnDeinit. Reason: %d", reason));
 
    //--- Delete in reverse construction order
+   if(g_basketMon  != NULL) { delete g_basketMon;  g_basketMon  = NULL; }
+   if(g_orderMgr   != NULL) { delete g_orderMgr;   g_orderMgr   = NULL; }
    if(g_execEngine != NULL) { delete g_execEngine; g_execEngine = NULL; }
    if(g_riskGuard  != NULL) { delete g_riskGuard;  g_riskGuard  = NULL; }
-   // Phases 4-10 pointers deleted here as they are added
+   // Phases 5-10 pointers deleted here as they are added
 
    if(g_logger != NULL) { delete g_logger; g_logger = NULL; }
 }
