@@ -260,6 +260,10 @@ struct DashboardSnapshot
 #define RTE_DEFAULT_RSI_OB         70.0
 #define RTE_DEFAULT_RSI_OS         30.0
 #define RTE_DEFAULT_FIB_TP_RATIO   1.618  // Fibonacci extension for range TP
+#define RTE_DEFAULT_ATR_AVG_BARS   20     // Bars used to compute ATR average for ratio
+#define RTE_DEFAULT_SLOPE_PTS      50.0   // Min absolute SMA slope in points for trend point
+#define RTE_DEFAULT_BB_WIDTH       0.002  // Min BB width ratio (upper-lower)/middle for trend point
+#define RTE_DEFAULT_ATR_RATIO      1.1    // Min ATR/ATR-avg ratio for trend point
 
 //══════════════════════════════════════════════════════════════════════
 // SECTION 4 — CLogger
@@ -1218,10 +1222,207 @@ public:
 };
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 10 — CRegimeDetector  [Phase 6]
+// SECTION 10 — CRegimeDetector
+//  Scoring model — each indicator awards 1 "trend point":
+//    1. ADX (bar 1) > adxThreshold
+//    2. |SMA slope bar1–bar2| in points > slopePtsThreshold
+//    3. BB width (upper–lower)/middle at bar 1 > bbWidthThreshold
+//    4. ATR[bar1] / mean(ATR[1..atrAvgBars]) > atrRatioThreshold
+//
+//  trendPoints 3-4 → TREND | 0-1 → RANGE | 2 → UNDETERMINED
+//  UNDETERMINED returns last valid classification (hysteresis).
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 6
+class CRegimeDetector
+{
+private:
+   CLogger*         m_logger;
+   string           m_symbol;
+   ENUM_TIMEFRAMES  m_timeframe;
+
+   //--- Indicator handles
+   int  m_handleADX;   // iADX  — buffer 0 = ADX main line
+   int  m_handleSMA;   // iMA   — SMA for slope (buffer 0)
+   int  m_handleBB;    // iBands — buf 0=middle, 1=upper, 2=lower
+   int  m_handleATR;   // iATR  — buffer 0 = ATR value
+
+   //--- Score thresholds
+   double m_adxThreshold;
+   double m_slopePtsThreshold;   // Abs SMA change in MT5 points
+   double m_bbWidthThreshold;    // (upper-lower)/middle ratio
+   double m_atrRatioThreshold;   // ATR[1] / ATR_average
+   int    m_atrAvgBars;          // How many bars for ATR average
+
+   ENUM_REGIME m_lastRegime;     // Fallback for UNDETERMINED
+
+   // ── Buffer helpers ───────────────────────────────────────────────
+
+   //--- Read a single value from buffer at bar startBar (1 = last closed)
+   bool ReadOne(int handle, int buffer, int startBar, double& val) const
+   {
+      double arr[1];
+      if(CopyBuffer(handle, buffer, startBar, 1, arr) != 1) return false;
+      val = arr[0];
+      return true;
+   }
+
+   //--- Read count values starting at bar startBar into a time-series array
+   bool ReadMany(int handle, int buffer, int startBar,
+                 int count, double& arr[]) const
+   {
+      ArraySetAsSeries(arr, true);
+      return CopyBuffer(handle, buffer, startBar, count, arr) == count;
+   }
+
+   // ── Individual scorers ───────────────────────────────────────────
+
+   //--- Returns true (trend point) if ADX at bar 1 > threshold
+   bool ScoreADX(double& adxVal) const
+   {
+      if(!ReadOne(m_handleADX, 0, 1, adxVal)) return false;
+      return adxVal > m_adxThreshold;
+   }
+
+   //--- Returns true if absolute SMA slope (bar1 minus bar2) in points
+   //    exceeds the threshold (steepness regardless of direction)
+   bool ScoreSMASlope(double& slopeVal) const
+   {
+      double sma1, sma2;
+      if(!ReadOne(m_handleSMA, 0, 1, sma1)) return false;
+      if(!ReadOne(m_handleSMA, 0, 2, sma2)) return false;
+      slopeVal = MathAbs(sma1 - sma2) / _Point;   // In MT5 points
+      return slopeVal > m_slopePtsThreshold;
+   }
+
+   //--- Returns true if BB width ratio (upper-lower)/middle at bar 1
+   //    exceeds threshold — wide bands signal trending volatility
+   bool ScoreBBWidth(double& bbWidth) const
+   {
+      double mid, upper, lower;
+      if(!ReadOne(m_handleBB, 0, 1, mid))   return false;
+      if(!ReadOne(m_handleBB, 1, 1, upper)) return false;
+      if(!ReadOne(m_handleBB, 2, 1, lower)) return false;
+      if(mid <= 0.0) return false;
+      bbWidth = (upper - lower) / mid;
+      return bbWidth > m_bbWidthThreshold;
+   }
+
+   //--- Returns true if ATR at bar 1 is elevated relative to its
+   //    rolling average — expanding range signals trend momentum
+   bool ScoreATRRatio(double& atrRatio) const
+   {
+      double atrBuf[];
+      if(!ReadMany(m_handleATR, 0, 1, m_atrAvgBars, atrBuf)) return false;
+
+      double atrCurrent = atrBuf[0];   // bar 1 (most recent in series array)
+      double atrSum     = 0.0;
+      for(int i = 0; i < m_atrAvgBars; i++) atrSum += atrBuf[i];
+      double atrAvg = atrSum / m_atrAvgBars;
+
+      if(atrAvg <= 0.0) return false;
+      atrRatio = atrCurrent / atrAvg;
+      return atrRatio > m_atrRatioThreshold;
+   }
+
+public:
+   CRegimeDetector(CLogger* logger)
+      : m_logger(logger),
+        m_symbol(""),
+        m_timeframe(PERIOD_CURRENT),
+        m_handleADX(INVALID_HANDLE),
+        m_handleSMA(INVALID_HANDLE),
+        m_handleBB(INVALID_HANDLE),
+        m_handleATR(INVALID_HANDLE),
+        m_adxThreshold(RTE_DEFAULT_ADX_THRESHOLD),
+        m_slopePtsThreshold(RTE_DEFAULT_SLOPE_PTS),
+        m_bbWidthThreshold(RTE_DEFAULT_BB_WIDTH),
+        m_atrRatioThreshold(RTE_DEFAULT_ATR_RATIO),
+        m_atrAvgBars(RTE_DEFAULT_ATR_AVG_BARS),
+        m_lastRegime(REGIME_UNDETERMINED) {}
+
+   //--- Creates all four indicator handles.  Returns false on any failure.
+   bool Init(const string symbol, ENUM_TIMEFRAMES tf,
+             int adxPeriod,  double adxThreshold,
+             int smaPeriod,  double slopePtsThreshold,
+             int bbPeriod,   double bbDeviation,  double bbWidthThreshold,
+             int atrPeriod,  double atrRatioThreshold)
+   {
+      m_symbol             = symbol;
+      m_timeframe          = tf;
+      m_adxThreshold       = adxThreshold;
+      m_slopePtsThreshold  = slopePtsThreshold;
+      m_bbWidthThreshold   = bbWidthThreshold;
+      m_atrRatioThreshold  = atrRatioThreshold;
+
+      m_handleADX = iADX  (symbol, tf, adxPeriod);
+      m_handleSMA = iMA   (symbol, tf, smaPeriod, 0, MODE_SMA, PRICE_CLOSE);
+      m_handleBB  = iBands(symbol, tf, bbPeriod, 0, bbDeviation, PRICE_CLOSE);
+      m_handleATR = iATR  (symbol, tf, atrPeriod);
+
+      if(m_handleADX == INVALID_HANDLE || m_handleSMA == INVALID_HANDLE ||
+         m_handleBB  == INVALID_HANDLE || m_handleATR == INVALID_HANDLE)
+      {
+         m_logger.Fatal("RegimeDet",
+            StringFormat("Handle creation failed — ADX:%d SMA:%d BB:%d ATR:%d err:%d",
+            m_handleADX, m_handleSMA, m_handleBB, m_handleATR, GetLastError()));
+         return false;
+      }
+
+      m_logger.Info("RegimeDet",
+         StringFormat("Init — %s ADX(%d/%.1f) SMA(%d/%.0fpts) BB(%d/%.1f/%.4f) ATR(%d/%.2f)",
+         symbol, adxPeriod, adxThreshold, smaPeriod, slopePtsThreshold,
+         bbPeriod, bbDeviation, bbWidthThreshold, atrPeriod, atrRatioThreshold));
+      return true;
+   }
+
+   //--- Compute full regime score.  Call each tick while in STATE_DETECTING.
+   RegimeScore Detect()
+   {
+      RegimeScore score;
+      score.detectionTime = TimeCurrent();
+
+      bool adxTrend   = ScoreADX     (score.adxValue);
+      bool slopeTrend = ScoreSMASlope(score.smaSlope);
+      bool bbTrend    = ScoreBBWidth (score.bbWidth);
+      bool atrTrend   = ScoreATRRatio(score.atrRatio);
+
+      score.trendPoints = (adxTrend ? 1 : 0) + (slopeTrend ? 1 : 0)
+                        + (bbTrend  ? 1 : 0) + (atrTrend   ? 1 : 0);
+
+      if     (score.trendPoints >= 3) score.classification = REGIME_TREND;
+      else if(score.trendPoints <= 1) score.classification = REGIME_RANGE;
+      else
+      {
+         //--- Tie (2/4): fall back to last known regime to avoid flip-flopping
+         score.classification = (m_lastRegime != REGIME_UNDETERMINED)
+                                 ? m_lastRegime
+                                 : REGIME_UNDETERMINED;
+      }
+
+      if(score.classification != REGIME_UNDETERMINED)
+         m_lastRegime = score.classification;
+
+      m_logger.Info("RegimeDet",
+         StringFormat("Score:%d/4 [ADX:%s SLP:%s BB:%s ATR:%s] → %s  "
+                      "adx=%.1f slp=%.1f bbW=%.4f atrR=%.2f",
+         score.trendPoints,
+         (adxTrend   ? "1" : "0"), (slopeTrend ? "1" : "0"),
+         (bbTrend    ? "1" : "0"), (atrTrend   ? "1" : "0"),
+         EnumToString(score.classification),
+         score.adxValue, score.smaSlope, score.bbWidth, score.atrRatio));
+
+      return score;
+   }
+
+   void Deinit()
+   {
+      if(m_handleADX != INVALID_HANDLE) { IndicatorRelease(m_handleADX); m_handleADX = INVALID_HANDLE; }
+      if(m_handleSMA != INVALID_HANDLE) { IndicatorRelease(m_handleSMA); m_handleSMA = INVALID_HANDLE; }
+      if(m_handleBB  != INVALID_HANDLE) { IndicatorRelease(m_handleBB);  m_handleBB  = INVALID_HANDLE; }
+      if(m_handleATR != INVALID_HANDLE) { IndicatorRelease(m_handleATR); m_handleATR = INVALID_HANDLE; }
+      m_logger.Debug("RegimeDet", "Handles released.");
+   }
+};
 
 //══════════════════════════════════════════════════════════════════════
 // SECTION 11 — CTrendRecovery  [Phase 7]
@@ -1263,6 +1464,7 @@ private:
    CEntryEngine*      m_entryEngine;
    CRiskGuard*        m_riskGuard;
    CBasketMonitor*    m_basketMon;
+   CRegimeDetector*   m_regimeDetector;   // Set via SetRegimeDetector() — Phase 6
    CLogger*           m_logger;
 
    //--- State machine — private; only methods of this class write it
@@ -1401,14 +1603,42 @@ private:
    }
 
    // ─── DETECTING ───────────────────────────────────────────────────
-   //  Phase 6: CRegimeDetector scores the market and sets m_activeRegime.
-   //  Stub until Phase 6.
+   //  Score the market via CRegimeDetector.  Transition to RECOVERY once
+   //  a definitive TREND or RANGE classification is returned.
+   //  Stay in DETECTING if result is UNDETERMINED (retries each tick).
 
    void OnDetecting()
    {
-      // Phase 6 — CRegimeDetector implemented here
-      m_logger.Warn("RecovEng",
-         "DETECTING: CRegimeDetector not yet implemented (Phase 6).");
+      if(m_regimeDetector == NULL)
+      {
+         m_logger.Error("RecovEng",
+            "DETECTING: CRegimeDetector not wired — cannot classify regime.");
+         return;
+      }
+
+      // Hard stop re-check: basket may have deepened while detecting
+      if(m_riskGuard.IsHardStopBreached())
+      {
+         m_logger.Fatal("RecovEng",
+            "DETECTING: hard stop breached — aborting to CLOSE.");
+         SetState(STATE_CLOSE);
+         return;
+      }
+
+      RegimeScore score = m_regimeDetector.Detect();
+
+      if(score.classification == REGIME_UNDETERMINED)
+      {
+         m_logger.Warn("RecovEng",
+            "DETECTING: regime undetermined (score 2/4) — retrying next tick.");
+         return;   // Stay in DETECTING
+      }
+
+      m_activeRegime = score.classification;
+      m_logger.Info("RecovEng",
+         StringFormat("DETECTING complete → %s  (trendPts:%d/4)",
+         EnumToString(m_activeRegime), score.trendPoints));
+      SetState(STATE_RECOVERY);
    }
 
    // ─── RECOVERY ────────────────────────────────────────────────────
@@ -1470,6 +1700,7 @@ public:
         m_entryEngine(entryEng),
         m_riskGuard(riskGuard),
         m_basketMon(basketMon),
+        m_regimeDetector(NULL),
         m_logger(logger),
         m_state(STATE_IDLE),
         m_symbol(""),
@@ -1506,11 +1737,15 @@ public:
       }
    }
 
+   //--- Phase 6: inject CRegimeDetector after construction
+   void SetRegimeDetector(CRegimeDetector* d)
+   {
+      m_regimeDetector = d;
+      m_logger.Info("RecovEng", "CRegimeDetector wired.");
+   }
+
    ENUM_ENGINE_STATE GetState()   const { return m_state; }
    ENUM_REGIME       GetRegime()  const { return m_activeRegime; }
-
-   //--- Used by CDashboardViewModel (Phase 9)
-   void SetActiveRegime(ENUM_REGIME r)   { m_activeRegime = r; }
 };
 
 //══════════════════════════════════════════════════════════════════════
@@ -1540,10 +1775,13 @@ input double Inp_MaxSpreadPoints       = RTE_DEFAULT_MAX_SPREAD;      // Max spr
 input group              "════ Regime Detection ════"
 input int    Inp_ADXPeriod             = RTE_DEFAULT_ADX_PERIOD;
 input double Inp_ADXThreshold          = RTE_DEFAULT_ADX_THRESHOLD;   // ADX above = trend point
-input int    Inp_ATRPeriod             = RTE_DEFAULT_ATR_PERIOD;
+input int    Inp_SMAPeriod             = RTE_DEFAULT_SMA_PERIOD;      // For slope calculation
+input double Inp_SlopePtsThreshold     = RTE_DEFAULT_SLOPE_PTS;       // Min |SMA slope| in points
 input int    Inp_BBPeriod              = RTE_DEFAULT_BB_PERIOD;
 input double Inp_BBDeviation           = RTE_DEFAULT_BB_DEVIATION;
-input int    Inp_SMAPeriod             = RTE_DEFAULT_SMA_PERIOD;      // For slope calculation
+input double Inp_BBWidthThreshold      = RTE_DEFAULT_BB_WIDTH;        // Min (upper-lower)/middle
+input int    Inp_ATRPeriod             = RTE_DEFAULT_ATR_PERIOD;
+input double Inp_ATRRatioThreshold     = RTE_DEFAULT_ATR_RATIO;       // Min ATR/ATR-avg ratio
 
 //--- RSI (Range Recovery filter)
 input group              "════ RSI Settings ════"
@@ -1562,8 +1800,9 @@ CExecutionEngine* g_execEngine  = NULL;
 COrderManager*    g_orderMgr    = NULL;
 CBasketMonitor*   g_basketMon   = NULL;
 CEntryEngine*     g_entryEng    = NULL;
+CRegimeDetector*  g_regimeDet   = NULL;
 CRecoveryEngine*  g_recovEng    = NULL;
-// Sections 10-14 pointers added per phase
+// Sections 11-14 pointers added per phase
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -1646,22 +1885,32 @@ int OnInit()
    g_basketMon = new CBasketMonitor(g_riskGuard, g_logger);
    g_basketMon.Init(Inp_RecoveryActivationUSD);
 
-   //--- 8. CEntryEngine (depends on nothing except CLogger)
+   //--- 8. CEntryEngine
    g_entryEng = new CEntryEngine(g_logger);
    if(!g_entryEng.Init(_Symbol, Inp_Timeframe, Inp_FastEMA, Inp_SlowEMA))
       return INIT_FAILED;
 
-   //--- 9. CRecoveryEngine (depends on all modules above)
+   //--- 9. CRegimeDetector
+   g_regimeDet = new CRegimeDetector(g_logger);
+   if(!g_regimeDet.Init(_Symbol, Inp_Timeframe,
+                        Inp_ADXPeriod,   Inp_ADXThreshold,
+                        Inp_SMAPeriod,   Inp_SlopePtsThreshold,
+                        Inp_BBPeriod,    Inp_BBDeviation, Inp_BBWidthThreshold,
+                        Inp_ATRPeriod,   Inp_ATRRatioThreshold))
+      return INIT_FAILED;
+
+   //--- 10. CRecoveryEngine (depends on all modules above)
    g_recovEng = new CRecoveryEngine(
       g_execEngine, g_orderMgr, g_entryEng,
       g_riskGuard,  g_basketMon, g_logger);
    g_recovEng.Init(_Symbol, Inp_EntryStopPoints, Inp_EntryUseSL, RTE_MAGIC_NUMBER);
+   g_recovEng.SetRegimeDetector(g_regimeDet);
 
-   //--- Phases 6-9: CRegimeDetector, CTrendRecovery, CRangeRecovery,
+   //--- Phases 7-9: CTrendRecovery, CRangeRecovery,
    //    CDashboardViewModel, CDashboardRenderer
-   //    — passed into CRecoveryEngine as added each phase.
+   //    — injected into CRecoveryEngine as added each phase.
 
-   g_logger.Info("EA", "Phase 5 ready — EntryEngine + RecoveryEngine online.");
+   g_logger.Info("EA", "Phase 6 ready — RegimeDetector online, DETECTING state active.");
    return INIT_SUCCEEDED;
 }
 
@@ -1680,12 +1929,13 @@ void OnDeinit(const int reason)
 
    //--- Delete in reverse construction order
    if(g_recovEng   != NULL) { delete g_recovEng;   g_recovEng   = NULL; }
-   if(g_entryEng   != NULL) { g_entryEng.Deinit(); delete g_entryEng; g_entryEng = NULL; }
+   if(g_regimeDet  != NULL) { g_regimeDet.Deinit();  delete g_regimeDet;  g_regimeDet  = NULL; }
+   if(g_entryEng   != NULL) { g_entryEng.Deinit();   delete g_entryEng;   g_entryEng   = NULL; }
    if(g_basketMon  != NULL) { delete g_basketMon;  g_basketMon  = NULL; }
    if(g_orderMgr   != NULL) { delete g_orderMgr;   g_orderMgr   = NULL; }
    if(g_execEngine != NULL) { delete g_execEngine; g_execEngine = NULL; }
    if(g_riskGuard  != NULL) { delete g_riskGuard;  g_riskGuard  = NULL; }
-   // Phases 6-9 pointers deleted here as they are added
+   // Phases 7-9 pointers deleted here as they are added
 
    if(g_logger != NULL) { delete g_logger; g_logger = NULL; }
 }
