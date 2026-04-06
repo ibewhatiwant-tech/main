@@ -808,10 +808,48 @@ public:
          ticket, retcode, contextTag));
       return false;
    }
-};
+   //--- Modify SL/TP of an existing position.
+   //    Used by CTrendRecovery for ATR trailing stops.
+   //    Bypasses dedupe registry — modifications never add exposure.
+   bool SubmitModify(ulong ticket, double sl, double tp,
+                     const string contextTag, TradeResult& res)
+   {
+      res           = TradeResult();
+      res.requestId = ++m_requestCounter;
 
-//══════════════════════════════════════════════════════════════════════
-// SECTION 7 — COrderManager
+      if(ticket == 0)
+      {
+         m_logger.Error("ExecEngine",
+            "SubmitModify: invalid ticket 0 tag:" + contextTag);
+         res.rejectionReason = REJECT_BROKER_REJECT;
+         return false;
+      }
+
+      m_logger.Debug("ExecEngine",
+         StringFormat("SubmitModify — ticket:%I64u sl:%.5f tp:%.5f tag:%s",
+         ticket, sl, tp, contextTag));
+
+      bool ok = m_trade.PositionModify(ticket, sl, tp);
+
+      uint retcode = m_trade.ResultRetcode();
+      if(ok && retcode == TRADE_RETCODE_DONE)
+      {
+         res.ticket  = ticket;
+         res.success = true;
+         m_logger.Debug("ExecEngine",
+            StringFormat("Modified — ticket:%I64u newSL:%.5f tag:%s",
+            ticket, sl, contextTag));
+         return true;
+      }
+
+      res.errorCode       = (int)retcode;
+      res.rejectionReason = REJECT_BROKER_REJECT;
+      m_logger.Error("ExecEngine",
+         StringFormat("Modify failed — ticket:%I64u retcode:%u tag:%s",
+         ticket, retcode, contextTag));
+      return false;
+   }
+};
 //  Responsibilities:
 //    • Authoritative registry of every basket position (PositionRecord[])
 //    • Reconcile against MT5 live positions each tick
@@ -1425,10 +1463,248 @@ public:
 };
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 11 — CTrendRecovery  [Phase 7]
+// SECTION 11 — CTrendRecovery
+//  Triggered when STATE_RECOVERY + regime == TREND.
+//
+//  Per-basket-cycle sequence (dedup ensures single execution):
+//    Tick 1+: PlaceHedge()        — trade opposite to basket net direction
+//    Tick 1+: PlaceContinuation() — second trade riding the same trend
+//    Every tick: UpdateATRTrail() — trail SL of both recovery positions
+//
+//  Lots: basket.totalLots × hedgeRatio and contRatio (clamped by maxLot)
+//  Trail distance: ATR[bar1] × atrMultiplier
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 7
+class CTrendRecovery
+{
+private:
+   CExecutionEngine*  m_execEngine;
+   CRiskGuard*        m_riskGuard;
+   CLogger*           m_logger;
+
+   string             m_symbol;
+   int                m_atrHandle;
+   double             m_atrMultiplier;
+   double             m_hedgeRatio;
+   double             m_contRatio;
+   double             m_maxLot;
+
+   //--- State within one basket lifecycle
+   bool   m_hedgePlaced;
+   bool   m_contPlaced;
+   ulong  m_hedgeTicket;
+   ulong  m_contTicket;
+
+   // ── Helpers ──────────────────────────────────────────────────────
+
+   double ReadATR() const
+   {
+      double buf[1];
+      if(CopyBuffer(m_atrHandle, 0, 1, 1, buf) != 1) return 0.0;
+      return buf[0];
+   }
+
+   //--- Clamp a raw lot to broker limits and the configured cap
+   double ClampLot(double rawLot) const
+   {
+      double lotMin  = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
+      double lotMax  = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MAX);
+      double lotStep = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_STEP);
+      if(lotStep <= 0.0) lotStep = 0.01;
+      double capped = MathMax(lotMin, MathMin(m_maxLot, MathMin(lotMax, rawLot)));
+      return NormalizeDouble(MathRound(capped / lotStep) * lotStep, 2);
+   }
+
+   //--- Direction opposite to basket net → hedge rides the trend
+   ENUM_ORDER_TYPE RecoveryDirection(const BasketSnapshot& snap) const
+   {
+      return (snap.netDirection >= 0) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   }
+
+   // ── Trade placement ───────────────────────────────────────────────
+
+   void PlaceHedge(const BasketSnapshot& snap)
+   {
+      if(m_hedgePlaced) return;
+      if(!m_riskGuard.IsSpreadAcceptable(m_symbol))
+      {
+         m_logger.Warn("TrendRec", "PlaceHedge: spread too high — skipping.");
+         return;
+      }
+
+      ENUM_ORDER_TYPE dir = RecoveryDirection(snap);
+      double lot = ClampLot(snap.totalLots * m_hedgeRatio);
+
+      TradeRequest req;
+      req.symbol         = m_symbol;
+      req.direction      = dir;
+      req.orderType      = dir;
+      req.lotSize        = lot;
+      req.isLotValidated = true;
+      req.contextTag     = "HEDGE_TREND";
+      req.magicNumber    = RTE_MAGIC_NUMBER;
+
+      TradeResult res;
+      if(m_execEngine.Submit(req, res))
+      {
+         m_hedgeTicket = res.ticket;
+         m_hedgePlaced = true;
+         m_logger.Info("TrendRec",
+            StringFormat("Hedge placed — %s %.2f lot  ticket:%I64u",
+            (dir == ORDER_TYPE_BUY ? "BUY" : "SELL"), lot, res.ticket));
+      }
+   }
+
+   void PlaceContinuation(const BasketSnapshot& snap)
+   {
+      if(m_contPlaced) return;
+      if(!m_hedgePlaced) return;   // Continuation only after hedge is confirmed
+      if(!m_riskGuard.IsSpreadAcceptable(m_symbol))
+      {
+         m_logger.Warn("TrendRec", "PlaceCont: spread too high — skipping.");
+         return;
+      }
+
+      ENUM_ORDER_TYPE dir = RecoveryDirection(snap);
+      double lot = ClampLot(snap.totalLots * m_contRatio);
+
+      TradeRequest req;
+      req.symbol         = m_symbol;
+      req.direction      = dir;
+      req.orderType      = dir;
+      req.lotSize        = lot;
+      req.isLotValidated = true;
+      req.contextTag     = "CONT_TREND";
+      req.magicNumber    = RTE_MAGIC_NUMBER;
+
+      TradeResult res;
+      if(m_execEngine.Submit(req, res))
+      {
+         m_contTicket = res.ticket;
+         m_contPlaced = true;
+         m_logger.Info("TrendRec",
+            StringFormat("Continuation placed — %s %.2f lot  ticket:%I64u",
+            (dir == ORDER_TYPE_BUY ? "BUY" : "SELL"), lot, res.ticket));
+      }
+   }
+
+   // ── ATR trailing stop ─────────────────────────────────────────────
+
+   void TrailPosition(ulong ticket, const string tag)
+   {
+      if(ticket == 0) return;
+      if(!PositionSelectByTicket(ticket)) return;   // Already closed
+
+      double atr = ReadATR();
+      if(atr <= 0.0) return;
+
+      ENUM_POSITION_TYPE posType =
+         (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      double trailDist = atr * m_atrMultiplier;
+
+      double newSL;
+      if(posType == POSITION_TYPE_BUY)
+      {
+         double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+         newSL = bid - trailDist;
+         // Only trail upward — never widen the stop
+         if(currentSL > 0.0 && newSL <= currentSL) return;
+      }
+      else
+      {
+         double ask = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+         newSL = ask + trailDist;
+         // Only trail downward
+         if(currentSL > 0.0 && newSL >= currentSL) return;
+      }
+
+      // Normalise to tick size
+      double tickSize = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+      newSL = NormalizeDouble(MathRound(newSL / tickSize) * tickSize,
+                              (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
+
+      TradeResult res;
+      m_execEngine.SubmitModify(ticket, newSL, currentTP, tag, res);
+   }
+
+   void UpdateATRTrail()
+   {
+      if(m_hedgePlaced) TrailPosition(m_hedgeTicket, "TRAIL_HEDGE");
+      if(m_contPlaced)  TrailPosition(m_contTicket,  "TRAIL_CONT");
+   }
+
+public:
+   CTrendRecovery(CExecutionEngine* exec, CRiskGuard* riskGuard, CLogger* logger)
+      : m_execEngine(exec),
+        m_riskGuard(riskGuard),
+        m_logger(logger),
+        m_symbol(""),
+        m_atrHandle(INVALID_HANDLE),
+        m_atrMultiplier(2.0),
+        m_hedgeRatio(1.0),
+        m_contRatio(0.5),
+        m_maxLot(RTE_DEFAULT_MAX_LOT),
+        m_hedgePlaced(false),
+        m_contPlaced(false),
+        m_hedgeTicket(0),
+        m_contTicket(0) {}
+
+   bool Init(const string symbol, ENUM_TIMEFRAMES tf, int atrPeriod,
+             double atrMultiplier, double hedgeRatio,
+             double contRatio,    double maxLot)
+   {
+      m_symbol        = symbol;
+      m_atrMultiplier = atrMultiplier;
+      m_hedgeRatio    = hedgeRatio;
+      m_contRatio     = contRatio;
+      m_maxLot        = maxLot;
+
+      m_atrHandle = iATR(symbol, tf, atrPeriod);
+      if(m_atrHandle == INVALID_HANDLE)
+      {
+         m_logger.Fatal("TrendRec",
+            StringFormat("Failed to create ATR handle — period:%d err:%d",
+            atrPeriod, GetLastError()));
+         return false;
+      }
+
+      m_logger.Info("TrendRec",
+         StringFormat("Init — ATR(%d) mult:%.1f hedgeR:%.2f contR:%.2f maxLot:%.2f",
+         atrPeriod, atrMultiplier, hedgeRatio, contRatio, maxLot));
+      return true;
+   }
+
+   //--- Called every tick while STATE_RECOVERY + REGIME_TREND.
+   //    Places recovery trades on first pass; trails stops on all passes.
+   void Process(const BasketSnapshot& snap)
+   {
+      PlaceHedge(snap);
+      PlaceContinuation(snap);
+      UpdateATRTrail();
+   }
+
+   //--- Reset state for next basket lifecycle
+   void Reset()
+   {
+      m_hedgePlaced = false;
+      m_contPlaced  = false;
+      m_hedgeTicket = 0;
+      m_contTicket  = 0;
+      m_logger.Debug("TrendRec", "Reset for new basket cycle.");
+   }
+
+   void Deinit()
+   {
+      if(m_atrHandle != INVALID_HANDLE)
+      {
+         IndicatorRelease(m_atrHandle);
+         m_atrHandle = INVALID_HANDLE;
+      }
+      m_logger.Debug("TrendRec", "Handle released.");
+   }
+};
 
 //══════════════════════════════════════════════════════════════════════
 // SECTION 12 — CRangeRecovery  [Phase 8]
@@ -1465,6 +1741,7 @@ private:
    CRiskGuard*        m_riskGuard;
    CBasketMonitor*    m_basketMon;
    CRegimeDetector*   m_regimeDetector;   // Set via SetRegimeDetector() — Phase 6
+   CTrendRecovery*    m_trendRecovery;    // Set via SetTrendRecovery()  — Phase 7
    CLogger*           m_logger;
 
    //--- State machine — private; only methods of this class write it
@@ -1642,14 +1919,57 @@ private:
    }
 
    // ─── RECOVERY ────────────────────────────────────────────────────
-   //  Phase 7/8: CTrendRecovery or CRangeRecovery dispatched here.
-   //  Stub until Phase 7.
+   //  Route to CTrendRecovery (Phase 7) or CRangeRecovery (Phase 8)
+   //  based on m_activeRegime.  Checks hard stop and recovery goal
+   //  each tick.  Transitions to CLOSE on success or hard stop.
 
    void OnRecovery()
    {
-      // Phase 7/8 — recovery modules implemented here
-      m_logger.Warn("RecovEng",
-         "RECOVERY: recovery modules not yet implemented (Phase 7/8).");
+      // Hard stop: forced exit regardless of recovery progress
+      if(m_riskGuard.IsHardStopBreached())
+      {
+         m_logger.Fatal("RecovEng",
+            "RECOVERY: hard stop breached — forcing CLOSE.");
+         SetState(STATE_CLOSE);
+         return;
+      }
+
+      m_orderMgr.ReconcileWithBroker();
+      BasketSnapshot snap = m_orderMgr.GetBasketSnapshot();
+
+      // Side-effect: feeds P&L to CRiskGuard hard stop check
+      m_basketMon.Evaluate(snap);
+
+      // Goal: basket P_net >= 0 → close everything
+      if(snap.netPnlUSD >= 0.0)
+      {
+         m_logger.Info("RecovEng",
+            StringFormat("RECOVERY complete — basket P&L: +%.2f USD → CLOSE.",
+            snap.netPnlUSD));
+         SetState(STATE_CLOSE);
+         return;
+      }
+
+      // Dispatch to regime-specific recovery module
+      if(m_activeRegime == REGIME_TREND)
+      {
+         if(m_trendRecovery != NULL)
+            m_trendRecovery.Process(snap);
+         else
+            m_logger.Warn("RecovEng",
+               "RECOVERY(TREND): CTrendRecovery not wired (Phase 7).");
+      }
+      else if(m_activeRegime == REGIME_RANGE)
+      {
+         // Phase 8: CRangeRecovery dispatched here
+         m_logger.Warn("RecovEng",
+            "RECOVERY(RANGE): CRangeRecovery not yet implemented (Phase 8).");
+      }
+      else
+      {
+         m_logger.Error("RecovEng",
+            "RECOVERY: active regime is UNDETERMINED — cannot dispatch.");
+      }
    }
 
    // ─── CLOSE ───────────────────────────────────────────────────────
@@ -1683,6 +2003,7 @@ private:
       m_orderMgr.Reset();
       m_basketMon.Reset();
       m_riskGuard.ClearHardStop();
+      if(m_trendRecovery != NULL) m_trendRecovery.Reset();
       m_pendingTicket = 0;
       m_activeRegime  = REGIME_UNDETERMINED;
       m_logger.Info("RecovEng", "Basket cycle reset complete.");
@@ -1701,6 +2022,7 @@ public:
         m_riskGuard(riskGuard),
         m_basketMon(basketMon),
         m_regimeDetector(NULL),
+        m_trendRecovery(NULL),
         m_logger(logger),
         m_state(STATE_IDLE),
         m_symbol(""),
@@ -1744,6 +2066,13 @@ public:
       m_logger.Info("RecovEng", "CRegimeDetector wired.");
    }
 
+   //--- Phase 7: inject CTrendRecovery after construction
+   void SetTrendRecovery(CTrendRecovery* t)
+   {
+      m_trendRecovery = t;
+      m_logger.Info("RecovEng", "CTrendRecovery wired.");
+   }
+
    ENUM_ENGINE_STATE GetState()   const { return m_state; }
    ENUM_REGIME       GetRegime()  const { return m_activeRegime; }
 };
@@ -1783,6 +2112,12 @@ input double Inp_BBWidthThreshold      = RTE_DEFAULT_BB_WIDTH;        // Min (up
 input int    Inp_ATRPeriod             = RTE_DEFAULT_ATR_PERIOD;
 input double Inp_ATRRatioThreshold     = RTE_DEFAULT_ATR_RATIO;       // Min ATR/ATR-avg ratio
 
+//--- Trend Recovery
+input group              "════ Trend Recovery ════"
+input double Inp_TrendHedgeRatio       = 1.0;    // Hedge lot = basket lots × ratio
+input double Inp_TrendContRatio        = 0.5;    // Continuation lot = basket lots × ratio
+input double Inp_TrendATRMultiplier    = 2.0;    // Trailing stop distance = ATR × multiplier
+
 //--- RSI (Range Recovery filter)
 input group              "════ RSI Settings ════"
 input int    Inp_RSIPeriod             = RTE_DEFAULT_RSI_PERIOD;
@@ -1801,8 +2136,9 @@ COrderManager*    g_orderMgr    = NULL;
 CBasketMonitor*   g_basketMon   = NULL;
 CEntryEngine*     g_entryEng    = NULL;
 CRegimeDetector*  g_regimeDet   = NULL;
+CTrendRecovery*   g_trendRec    = NULL;
 CRecoveryEngine*  g_recovEng    = NULL;
-// Sections 11-14 pointers added per phase
+// Sections 12-14 pointers added per phase
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -1899,18 +2235,25 @@ int OnInit()
                         Inp_ATRPeriod,   Inp_ATRRatioThreshold))
       return INIT_FAILED;
 
-   //--- 10. CRecoveryEngine (depends on all modules above)
+   //--- 10. CTrendRecovery (depends on CExecutionEngine + CRiskGuard)
+   g_trendRec = new CTrendRecovery(g_execEngine, g_riskGuard, g_logger);
+   if(!g_trendRec.Init(_Symbol, Inp_Timeframe, Inp_ATRPeriod,
+                       Inp_TrendATRMultiplier, Inp_TrendHedgeRatio,
+                       Inp_TrendContRatio, Inp_MaxLot))
+      return INIT_FAILED;
+
+   //--- 11. CRecoveryEngine (depends on all modules above)
    g_recovEng = new CRecoveryEngine(
       g_execEngine, g_orderMgr, g_entryEng,
       g_riskGuard,  g_basketMon, g_logger);
    g_recovEng.Init(_Symbol, Inp_EntryStopPoints, Inp_EntryUseSL, RTE_MAGIC_NUMBER);
    g_recovEng.SetRegimeDetector(g_regimeDet);
+   g_recovEng.SetTrendRecovery(g_trendRec);
 
-   //--- Phases 7-9: CTrendRecovery, CRangeRecovery,
-   //    CDashboardViewModel, CDashboardRenderer
+   //--- Phases 8-9: CRangeRecovery, CDashboardViewModel, CDashboardRenderer
    //    — injected into CRecoveryEngine as added each phase.
 
-   g_logger.Info("EA", "Phase 6 ready — RegimeDetector online, DETECTING state active.");
+   g_logger.Info("EA", "Phase 7 ready — TrendRecovery online, RECOVERY(TREND) active.");
    return INIT_SUCCEEDED;
 }
 
@@ -1928,14 +2271,15 @@ void OnDeinit(const int reason)
       g_logger.Info("EA", StringFormat("OnDeinit. Reason: %d", reason));
 
    //--- Delete in reverse construction order
-   if(g_recovEng   != NULL) { delete g_recovEng;   g_recovEng   = NULL; }
-   if(g_regimeDet  != NULL) { g_regimeDet.Deinit();  delete g_regimeDet;  g_regimeDet  = NULL; }
-   if(g_entryEng   != NULL) { g_entryEng.Deinit();   delete g_entryEng;   g_entryEng   = NULL; }
+   if(g_recovEng   != NULL) { delete g_recovEng;                         g_recovEng   = NULL; }
+   if(g_trendRec   != NULL) { g_trendRec.Deinit();   delete g_trendRec;  g_trendRec   = NULL; }
+   if(g_regimeDet  != NULL) { g_regimeDet.Deinit();  delete g_regimeDet; g_regimeDet  = NULL; }
+   if(g_entryEng   != NULL) { g_entryEng.Deinit();   delete g_entryEng;  g_entryEng   = NULL; }
    if(g_basketMon  != NULL) { delete g_basketMon;  g_basketMon  = NULL; }
    if(g_orderMgr   != NULL) { delete g_orderMgr;   g_orderMgr   = NULL; }
    if(g_execEngine != NULL) { delete g_execEngine; g_execEngine = NULL; }
    if(g_riskGuard  != NULL) { delete g_riskGuard;  g_riskGuard  = NULL; }
-   // Phases 7-9 pointers deleted here as they are added
+   // Phase 8-9 pointers deleted here as they are added
 
    if(g_logger != NULL) { delete g_logger; g_logger = NULL; }
 }
