@@ -3,8 +3,8 @@
 //|                          Recovery Trade Engine — Single-File EA  |
 //|                                                                  |
 //|  Architecture: 16 sections, single file                         |
-//|  Sections 1-4 + EA skeleton implemented in Phase 2              |
-//|  All remaining sections stubbed; filled phase-by-phase           |
+//|  Phase 10 Final Integration — all sections complete              |
+//|  Architecture constraint: only CExecutionEngine calls CTrade     |
 //+------------------------------------------------------------------+
 #property copyright   "Recovery Trade Engine"
 #property version     "1.00"
@@ -2707,6 +2707,31 @@ int OnInit()
       g_logger.Fatal("EA", "EntryStopPoints must be > 0");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(Inp_TrendHedgeRatio <= 0.0)
+   {
+      g_logger.Fatal("EA", "TrendHedgeRatio must be > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(Inp_TrendContRatio <= 0.0)
+   {
+      g_logger.Fatal("EA", "TrendContRatio must be > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(Inp_RangeLookback < 10)
+   {
+      g_logger.Fatal("EA", "RangeLookback must be >= 10");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(Inp_RangeFibTPRatio <= 0.0)
+   {
+      g_logger.Fatal("EA", "RangeFibTPRatio must be > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(Inp_ATRRatioThreshold <= 0.0)
+   {
+      g_logger.Fatal("EA", "ATRRatioThreshold must be > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
 
    //--- 3. Log validated configuration
    g_logger.Info("EA", StringFormat(
@@ -2769,23 +2794,14 @@ int OnInit()
                        Inp_RangeLotRatio, Inp_MaxLot))
       return INIT_FAILED;
 
-   //--- 12. CRecoveryEngine (depends on all modules above)
-   g_recovEng = new CRecoveryEngine(
-      g_execEngine, g_orderMgr, g_entryEng,
-      g_riskGuard,  g_basketMon, g_logger);
-   g_recovEng.Init(_Symbol, Inp_EntryStopPoints, Inp_EntryUseSL, RTE_MAGIC_NUMBER);
-   g_recovEng.SetRegimeDetector(g_regimeDet);
-   g_recovEng.SetTrendRecovery(g_trendRec);
-   g_recovEng.SetRangeRecovery(g_rangeRec);
-
-   //--- 13. CDashboardViewModel (depends on COrderManager + CRiskGuard)
+   //--- 12. CDashboardViewModel (depends on COrderManager + CRiskGuard)
    g_dashVM = new CDashboardViewModel(g_orderMgr, g_riskGuard, g_logger);
 
-   //--- 14. CDashboardRenderer
+   //--- 13. CDashboardRenderer
    g_dashRend = new CDashboardRenderer(g_logger);
    g_dashRend.Init(RTE_MAGIC_NUMBER);
 
-   //--- 15. CRecoveryEngine (depends on all modules above)
+   //--- 14. CRecoveryEngine (constructed last — depends on all modules above)
    g_recovEng = new CRecoveryEngine(
       g_execEngine, g_orderMgr, g_entryEng,
       g_riskGuard,  g_basketMon, g_logger);
@@ -2794,7 +2810,7 @@ int OnInit()
    g_recovEng.SetTrendRecovery(g_trendRec);
    g_recovEng.SetRangeRecovery(g_rangeRec);
 
-   g_logger.Info("EA", "Phase 9 ready — Dashboard online. All modules active.");
+   g_logger.Info("EA", "RecoveryTradeEngine v" RTE_VERSION_STRING " ready — all modules active.");
    return INIT_SUCCEEDED;
 }
 
@@ -2820,8 +2836,7 @@ void OnDeinit(const int reason)
    if(g_logger != NULL)
       g_logger.Info("EA", StringFormat("OnDeinit. Reason: %d", reason));
 
-   //--- Delete in reverse construction order
-   //--- Reverse construction order
+   //--- Delete in reverse construction order (14 → 1)
    if(g_recovEng  != NULL) { delete g_recovEng;                          g_recovEng  = NULL; }
    if(g_dashRend  != NULL) { g_dashRend.Deinit();  delete g_dashRend;    g_dashRend  = NULL; }
    if(g_dashVM    != NULL) { delete g_dashVM;                            g_dashVM    = NULL; }
