@@ -1570,6 +1570,32 @@ private:
 
    // ── Trade placement ───────────────────────────────────────────────
 
+   //--- Compute an initial ATR-based SL for market orders placed by this module.
+   //    Uses current market price as a proxy for fill price; TrailPosition()
+   //    will tighten it on every subsequent tick.
+   double InitialSL(ENUM_ORDER_TYPE dir) const
+   {
+      double atr = ReadATR();
+      if(atr <= 0.0) return 0.0;   // No SL if ATR unavailable; trail will set it next tick
+
+      double tickSize = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+      int    digits   = (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS);
+      double trailDist = atr * m_atrMultiplier;
+
+      double sl;
+      if(dir == ORDER_TYPE_SELL)
+      {
+         double ask = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+         sl = NormalizeDouble(MathRound((ask + trailDist) / tickSize) * tickSize, digits);
+      }
+      else
+      {
+         double bid = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+         sl = NormalizeDouble(MathRound((bid - trailDist) / tickSize) * tickSize, digits);
+      }
+      return sl;
+   }
+
    void PlaceHedge(const BasketSnapshot& snap)
    {
       if(m_hedgePlaced) return;
@@ -1581,12 +1607,14 @@ private:
 
       ENUM_ORDER_TYPE dir = RecoveryDirection(snap);
       double lot = ClampLot(snap.totalLots * m_hedgeRatio);
+      double sl  = InitialSL(dir);
 
       TradeRequest req;
       req.symbol         = m_symbol;
       req.direction      = dir;
       req.orderType      = dir;
       req.lotSize        = lot;
+      req.stopLoss       = sl;
       req.isLotValidated = true;
       req.contextTag     = "HEDGE_TREND";
       req.magicNumber    = RTE_MAGIC_NUMBER;
@@ -1597,8 +1625,8 @@ private:
          m_hedgeTicket = res.ticket;
          m_hedgePlaced = true;
          m_logger.Info("TrendRec",
-            StringFormat("Hedge placed — %s %.2f lot  ticket:%I64u",
-            (dir == ORDER_TYPE_BUY ? "BUY" : "SELL"), lot, res.ticket));
+            StringFormat("Hedge placed — %s %.2f lot  SL:%.5f  ticket:%I64u",
+            (dir == ORDER_TYPE_BUY ? "BUY" : "SELL"), lot, sl, res.ticket));
       }
    }
 
@@ -1614,12 +1642,14 @@ private:
 
       ENUM_ORDER_TYPE dir = RecoveryDirection(snap);
       double lot = ClampLot(snap.totalLots * m_contRatio);
+      double sl  = InitialSL(dir);
 
       TradeRequest req;
       req.symbol         = m_symbol;
       req.direction      = dir;
       req.orderType      = dir;
       req.lotSize        = lot;
+      req.stopLoss       = sl;
       req.isLotValidated = true;
       req.contextTag     = "CONT_TREND";
       req.magicNumber    = RTE_MAGIC_NUMBER;
@@ -1630,8 +1660,8 @@ private:
          m_contTicket = res.ticket;
          m_contPlaced = true;
          m_logger.Info("TrendRec",
-            StringFormat("Continuation placed — %s %.2f lot  ticket:%I64u",
-            (dir == ORDER_TYPE_BUY ? "BUY" : "SELL"), lot, res.ticket));
+            StringFormat("Continuation placed — %s %.2f lot  SL:%.5f  ticket:%I64u",
+            (dir == ORDER_TYPE_BUY ? "BUY" : "SELL"), lot, sl, res.ticket));
       }
    }
 
