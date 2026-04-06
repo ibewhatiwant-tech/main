@@ -1707,10 +1707,240 @@ public:
 };
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 12 — CRangeRecovery  [Phase 8]
+// SECTION 12 — CRangeRecovery
+//  Triggered when STATE_RECOVERY + regime == RANGE.
+//
+//  Strategy per basket cycle (dedup ensures single execution):
+//    Wait until RSI confirms counter-direction exhaustion, then:
+//    PlaceHedge() — trade opposite basket direction
+//      TP  = hedge_entry ± (rangeSize × fibTPRatio)
+//      SL  = 0.0 (hard stop from CRiskGuard is the safety net)
+//    No further action; fixed TP manages exit automatically.
+//
+//  RSI filter:
+//    Net LONG basket (losing)  → sell hedge when RSI[bar1] >= rsiSellThresh
+//    Net SHORT basket (losing) → buy  hedge when RSI[bar1] <= rsiBuyThresh
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 8
+class CRangeRecovery
+{
+private:
+   CExecutionEngine*  m_execEngine;
+   CRiskGuard*        m_riskGuard;
+   CLogger*           m_logger;
+
+   string             m_symbol;
+   ENUM_TIMEFRAMES    m_timeframe;
+   int                m_rsiHandle;
+   int                m_rangeLookback;   // Bars for swing high/low range
+   double             m_fibTPRatio;      // TP = rangeSize × ratio
+   double             m_rsiSellThresh;   // RSI >= this → sell hedge allowed
+   double             m_rsiBuyThresh;    // RSI <= this → buy  hedge allowed
+   double             m_lotRatio;        // Hedge lot = totalLots × ratio
+   double             m_maxLot;
+
+   bool   m_hedgePlaced;
+   ulong  m_hedgeTicket;
+
+   // ── Helpers ──────────────────────────────────────────────────────
+
+   double ReadRSI() const
+   {
+      double buf[1];
+      if(CopyBuffer(m_rsiHandle, 0, 1, 1, buf) != 1) return 50.0;
+      return buf[0];
+   }
+
+   //--- Compute swing high and low over m_rangeLookback completed bars.
+   //    Returns false if data unavailable.
+   bool ComputeRange(double& rangeHigh, double& rangeLow) const
+   {
+      double highs[], lows[];
+      int copied = (int)MathMin(m_rangeLookback,
+                                Bars(m_symbol, m_timeframe) - 1);
+      if(copied < 2) return false;
+
+      if(CopyHigh(m_symbol, m_timeframe, 1, copied, highs) != copied) return false;
+      if(CopyLow (m_symbol, m_timeframe, 1, copied, lows)  != copied) return false;
+
+      rangeHigh = highs[ArrayMaximum(highs, 0, copied)];
+      rangeLow  = lows [ArrayMinimum(lows,  0, copied)];
+      return (rangeHigh > rangeLow);
+   }
+
+   //--- Returns true when RSI confirms the hedge direction
+   bool RSIConfirms(ENUM_ORDER_TYPE hedgeDir) const
+   {
+      double rsi = ReadRSI();
+      if(hedgeDir == ORDER_TYPE_SELL) return rsi >= m_rsiSellThresh;
+      return rsi <= m_rsiBuyThresh;
+   }
+
+   double ClampLot(double rawLot) const
+   {
+      double lotMin  = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
+      double lotMax  = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MAX);
+      double lotStep = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_STEP);
+      if(lotStep <= 0.0) lotStep = 0.01;
+      double capped = MathMax(lotMin, MathMin(m_maxLot, MathMin(lotMax, rawLot)));
+      return NormalizeDouble(MathRound(capped / lotStep) * lotStep, 2);
+   }
+
+   // ── Trade placement ───────────────────────────────────────────────
+
+   void PlaceHedge(const BasketSnapshot& snap)
+   {
+      if(m_hedgePlaced) return;
+
+      ENUM_ORDER_TYPE dir = (snap.netDirection >= 0)
+                            ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+
+      // RSI must confirm before placing
+      if(!RSIConfirms(dir))
+      {
+         m_logger.Debug("RangeRec",
+            StringFormat("RSI not ready — rsi:%.1f sellThr:%.1f buyThr:%.1f",
+            ReadRSI(), m_rsiSellThresh, m_rsiBuyThresh));
+         return;
+      }
+
+      if(!m_riskGuard.IsSpreadAcceptable(m_symbol))
+      {
+         m_logger.Warn("RangeRec", "PlaceHedge: spread too high — waiting.");
+         return;
+      }
+
+      double rangeHigh, rangeLow;
+      if(!ComputeRange(rangeHigh, rangeLow))
+      {
+         m_logger.Error("RangeRec", "PlaceHedge: cannot compute range.");
+         return;
+      }
+
+      double rangeSize = rangeHigh - rangeLow;
+      int    digits    = (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS);
+      double tickSize  = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+
+      //--- Entry price and Fibonacci TP
+      double entryPrice, tp;
+      if(dir == ORDER_TYPE_SELL)
+      {
+         entryPrice = SymbolInfoDouble(m_symbol, SYMBOL_BID);
+         tp = NormalizeDouble(
+              MathRound((entryPrice - rangeSize * m_fibTPRatio) / tickSize)
+              * tickSize, digits);
+      }
+      else
+      {
+         entryPrice = SymbolInfoDouble(m_symbol, SYMBOL_ASK);
+         tp = NormalizeDouble(
+              MathRound((entryPrice + rangeSize * m_fibTPRatio) / tickSize)
+              * tickSize, digits);
+      }
+
+      // Sanity: TP must be on the right side of entry
+      if(dir == ORDER_TYPE_SELL && tp >= entryPrice) return;
+      if(dir == ORDER_TYPE_BUY  && tp <= entryPrice) return;
+
+      double lot = ClampLot(snap.totalLots * m_lotRatio);
+
+      TradeRequest req;
+      req.symbol         = m_symbol;
+      req.direction      = dir;
+      req.orderType      = dir;
+      req.lotSize        = lot;
+      req.takeProfit     = tp;
+      req.stopLoss       = 0.0;   // Hard stop handles worst-case
+      req.isLotValidated = true;
+      req.contextTag     = "HEDGE_RANGE";
+      req.magicNumber    = RTE_MAGIC_NUMBER;
+
+      TradeResult res;
+      if(m_execEngine.Submit(req, res))
+      {
+         m_hedgeTicket = res.ticket;
+         m_hedgePlaced = true;
+         m_logger.Info("RangeRec",
+            StringFormat("Hedge placed — %s %.2f lot  TP:%.5f  rangeSize:%.5f  "
+                         "fibR:%.3f  ticket:%I64u",
+            (dir == ORDER_TYPE_BUY ? "BUY" : "SELL"),
+            lot, tp, rangeSize, m_fibTPRatio, res.ticket));
+      }
+   }
+
+public:
+   CRangeRecovery(CExecutionEngine* exec, CRiskGuard* riskGuard, CLogger* logger)
+      : m_execEngine(exec),
+        m_riskGuard(riskGuard),
+        m_logger(logger),
+        m_symbol(""),
+        m_timeframe(PERIOD_CURRENT),
+        m_rsiHandle(INVALID_HANDLE),
+        m_rangeLookback(50),
+        m_fibTPRatio(RTE_DEFAULT_FIB_TP_RATIO),
+        m_rsiSellThresh(RTE_DEFAULT_RSI_OB),
+        m_rsiBuyThresh(RTE_DEFAULT_RSI_OS),
+        m_lotRatio(1.0),
+        m_maxLot(RTE_DEFAULT_MAX_LOT),
+        m_hedgePlaced(false),
+        m_hedgeTicket(0) {}
+
+   bool Init(const string symbol, ENUM_TIMEFRAMES tf,
+             int rsiPeriod,     double rsiSellThresh, double rsiBuyThresh,
+             int rangeLookback, double fibTPRatio,
+             double lotRatio,   double maxLot)
+   {
+      m_symbol        = symbol;
+      m_timeframe     = tf;
+      m_rangeLookback = rangeLookback;
+      m_fibTPRatio    = fibTPRatio;
+      m_rsiSellThresh = rsiSellThresh;
+      m_rsiBuyThresh  = rsiBuyThresh;
+      m_lotRatio      = lotRatio;
+      m_maxLot        = maxLot;
+
+      m_rsiHandle = iRSI(symbol, tf, rsiPeriod, PRICE_CLOSE);
+      if(m_rsiHandle == INVALID_HANDLE)
+      {
+         m_logger.Fatal("RangeRec",
+            StringFormat("RSI handle failed — period:%d err:%d",
+            rsiPeriod, GetLastError()));
+         return false;
+      }
+
+      m_logger.Info("RangeRec",
+         StringFormat("Init — RSI(%d) sellThr:%.1f buyThr:%.1f "
+                      "range:%d bars  fibTP:%.3f  lotRatio:%.2f",
+         rsiPeriod, rsiSellThresh, rsiBuyThresh,
+         rangeLookback, fibTPRatio, lotRatio));
+      return true;
+   }
+
+   //--- Called every tick while STATE_RECOVERY + REGIME_RANGE.
+   //    Waits for RSI confirmation then places a single fixed-TP hedge.
+   void Process(const BasketSnapshot& snap)
+   {
+      PlaceHedge(snap);
+      // No trailing logic — fixed TP manages exit
+   }
+
+   void Reset()
+   {
+      m_hedgePlaced = false;
+      m_hedgeTicket = 0;
+      m_logger.Debug("RangeRec", "Reset for new basket cycle.");
+   }
+
+   void Deinit()
+   {
+      if(m_rsiHandle != INVALID_HANDLE)
+      {
+         IndicatorRelease(m_rsiHandle);
+         m_rsiHandle = INVALID_HANDLE;
+      }
+      m_logger.Debug("RangeRec", "Handle released.");
+   }
+};
 
 //══════════════════════════════════════════════════════════════════════
 // SECTION 13 — CDashboardViewModel  [Phase 9]
@@ -1742,6 +1972,7 @@ private:
    CBasketMonitor*    m_basketMon;
    CRegimeDetector*   m_regimeDetector;   // Set via SetRegimeDetector() — Phase 6
    CTrendRecovery*    m_trendRecovery;    // Set via SetTrendRecovery()  — Phase 7
+   CRangeRecovery*    m_rangeRecovery;    // Set via SetRangeRecovery()  — Phase 8
    CLogger*           m_logger;
 
    //--- State machine — private; only methods of this class write it
@@ -1961,9 +2192,11 @@ private:
       }
       else if(m_activeRegime == REGIME_RANGE)
       {
-         // Phase 8: CRangeRecovery dispatched here
-         m_logger.Warn("RecovEng",
-            "RECOVERY(RANGE): CRangeRecovery not yet implemented (Phase 8).");
+         if(m_rangeRecovery != NULL)
+            m_rangeRecovery.Process(snap);
+         else
+            m_logger.Warn("RecovEng",
+               "RECOVERY(RANGE): CRangeRecovery not wired (Phase 8).");
       }
       else
       {
@@ -2004,6 +2237,7 @@ private:
       m_basketMon.Reset();
       m_riskGuard.ClearHardStop();
       if(m_trendRecovery != NULL) m_trendRecovery.Reset();
+      if(m_rangeRecovery != NULL) m_rangeRecovery.Reset();
       m_pendingTicket = 0;
       m_activeRegime  = REGIME_UNDETERMINED;
       m_logger.Info("RecovEng", "Basket cycle reset complete.");
@@ -2023,6 +2257,7 @@ public:
         m_basketMon(basketMon),
         m_regimeDetector(NULL),
         m_trendRecovery(NULL),
+        m_rangeRecovery(NULL),
         m_logger(logger),
         m_state(STATE_IDLE),
         m_symbol(""),
@@ -2073,6 +2308,13 @@ public:
       m_logger.Info("RecovEng", "CTrendRecovery wired.");
    }
 
+   //--- Phase 8: inject CRangeRecovery after construction
+   void SetRangeRecovery(CRangeRecovery* r)
+   {
+      m_rangeRecovery = r;
+      m_logger.Info("RecovEng", "CRangeRecovery wired.");
+   }
+
    ENUM_ENGINE_STATE GetState()   const { return m_state; }
    ENUM_REGIME       GetRegime()  const { return m_activeRegime; }
 };
@@ -2118,11 +2360,17 @@ input double Inp_TrendHedgeRatio       = 1.0;    // Hedge lot = basket lots × r
 input double Inp_TrendContRatio        = 0.5;    // Continuation lot = basket lots × ratio
 input double Inp_TrendATRMultiplier    = 2.0;    // Trailing stop distance = ATR × multiplier
 
+//--- Range Recovery
+input group              "════ Range Recovery ════"
+input int    Inp_RangeLookback         = 50;                          // Bars for swing H/L range
+input double Inp_RangeFibTPRatio       = RTE_DEFAULT_FIB_TP_RATIO;   // TP = rangeSize × ratio
+input double Inp_RangeLotRatio         = 1.0;                        // Hedge lot = basket lots × ratio
+
 //--- RSI (Range Recovery filter)
 input group              "════ RSI Settings ════"
 input int    Inp_RSIPeriod             = RTE_DEFAULT_RSI_PERIOD;
-input double Inp_RSI_OB                = RTE_DEFAULT_RSI_OB;          // Overbought threshold
-input double Inp_RSI_OS                = RTE_DEFAULT_RSI_OS;          // Oversold threshold
+input double Inp_RSI_OB                = RTE_DEFAULT_RSI_OB;          // Overbought → sell hedge
+input double Inp_RSI_OS                = RTE_DEFAULT_RSI_OS;          // Oversold   → buy hedge
 
 //--- Logging
 input group              "════ Logging ════"
@@ -2137,8 +2385,9 @@ CBasketMonitor*   g_basketMon   = NULL;
 CEntryEngine*     g_entryEng    = NULL;
 CRegimeDetector*  g_regimeDet   = NULL;
 CTrendRecovery*   g_trendRec    = NULL;
+CRangeRecovery*   g_rangeRec    = NULL;
 CRecoveryEngine*  g_recovEng    = NULL;
-// Sections 12-14 pointers added per phase
+// Sections 13-14 pointers added per phase
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -2242,18 +2491,27 @@ int OnInit()
                        Inp_TrendContRatio, Inp_MaxLot))
       return INIT_FAILED;
 
-   //--- 11. CRecoveryEngine (depends on all modules above)
+   //--- 11. CRangeRecovery (depends on CExecutionEngine + CRiskGuard)
+   g_rangeRec = new CRangeRecovery(g_execEngine, g_riskGuard, g_logger);
+   if(!g_rangeRec.Init(_Symbol, Inp_Timeframe,
+                       Inp_RSIPeriod,    Inp_RSI_OB,     Inp_RSI_OS,
+                       Inp_RangeLookback, Inp_RangeFibTPRatio,
+                       Inp_RangeLotRatio, Inp_MaxLot))
+      return INIT_FAILED;
+
+   //--- 12. CRecoveryEngine (depends on all modules above)
    g_recovEng = new CRecoveryEngine(
       g_execEngine, g_orderMgr, g_entryEng,
       g_riskGuard,  g_basketMon, g_logger);
    g_recovEng.Init(_Symbol, Inp_EntryStopPoints, Inp_EntryUseSL, RTE_MAGIC_NUMBER);
    g_recovEng.SetRegimeDetector(g_regimeDet);
    g_recovEng.SetTrendRecovery(g_trendRec);
+   g_recovEng.SetRangeRecovery(g_rangeRec);
 
-   //--- Phases 8-9: CRangeRecovery, CDashboardViewModel, CDashboardRenderer
-   //    — injected into CRecoveryEngine as added each phase.
+   //--- Phase 9: CDashboardViewModel + CDashboardRenderer
+   //    — injected into CRecoveryEngine as added next phase.
 
-   g_logger.Info("EA", "Phase 7 ready — TrendRecovery online, RECOVERY(TREND) active.");
+   g_logger.Info("EA", "Phase 8 ready — RangeRecovery online, both RECOVERY paths active.");
    return INIT_SUCCEEDED;
 }
 
@@ -2273,13 +2531,14 @@ void OnDeinit(const int reason)
    //--- Delete in reverse construction order
    if(g_recovEng   != NULL) { delete g_recovEng;                         g_recovEng   = NULL; }
    if(g_trendRec   != NULL) { g_trendRec.Deinit();   delete g_trendRec;  g_trendRec   = NULL; }
+   if(g_rangeRec   != NULL) { g_rangeRec.Deinit();   delete g_rangeRec;  g_rangeRec   = NULL; }
    if(g_regimeDet  != NULL) { g_regimeDet.Deinit();  delete g_regimeDet; g_regimeDet  = NULL; }
    if(g_entryEng   != NULL) { g_entryEng.Deinit();   delete g_entryEng;  g_entryEng   = NULL; }
    if(g_basketMon  != NULL) { delete g_basketMon;  g_basketMon  = NULL; }
    if(g_orderMgr   != NULL) { delete g_orderMgr;   g_orderMgr   = NULL; }
    if(g_execEngine != NULL) { delete g_execEngine; g_execEngine = NULL; }
    if(g_riskGuard  != NULL) { delete g_riskGuard;  g_riskGuard  = NULL; }
-   // Phase 8-9 pointers deleted here as they are added
+   // Phase 9 pointers deleted here as added
 
    if(g_logger != NULL) { delete g_logger; g_logger = NULL; }
 }
