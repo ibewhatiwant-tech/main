@@ -55,7 +55,8 @@ enum ENUM_REJECTION_REASON
    REJECT_HARD_STOP_ACTIVE  = 5,  // CRiskGuard hard stop flag is set
    REJECT_BROKER_REJECT     = 6,  // MT5 returned a trade error
    REJECT_SYMBOL_MISMATCH   = 7,  // Request symbol != EA symbol
-   REJECT_EMPTY_CONTEXT_TAG = 8   // contextTag is "" — required for dedup key
+   REJECT_EMPTY_CONTEXT_TAG = 8,  // contextTag is "" — required for dedup key
+   REJECT_TOTAL_EXPOSURE    = 9   // basket lots + req.lotSize > MaxTotalExposureLots
 };
 
 enum ENUM_LOG_LEVEL
@@ -248,8 +249,9 @@ struct DashboardSnapshot
 #define RTE_DEFAULT_RECOVERY_USD   50.0
 #define RTE_DEFAULT_HARD_STOP_USD  200.0
 #define RTE_DEFAULT_MAX_SPREAD     30.0   // In points
-#define RTE_DEFAULT_MAX_LOT        5.0
-#define RTE_DEFAULT_RISK_PERCENT   1.0
+#define RTE_DEFAULT_MAX_LOT          5.0
+#define RTE_DEFAULT_MAX_TOTAL_LOTS  10.0   // Global exposure cap: sum of all basket lots
+#define RTE_DEFAULT_RISK_PERCENT     1.0
 #define RTE_DEFAULT_ADX_PERIOD     14
 #define RTE_DEFAULT_ADX_THRESHOLD  25.0
 #define RTE_DEFAULT_ATR_PERIOD     14
@@ -332,7 +334,9 @@ private:
    double    m_maxLot;            // Absolute lot cap regardless of risk calc
    double    m_riskPercent;       // % of account balance risked per trade
    double    m_hardStopUSD;       // Basket loss that triggers forced close
-   bool      m_hardStopBreached;  // Sticky flag; cleared only on ClearHardStop()
+   bool      m_hardStopBreached;    // Sticky flag; cleared only on ClearHardStop()
+   double    m_maxTotalLots;        // Global exposure cap (sum of all basket lots)
+   double    m_basketLots;          // Updated each tick via SetBasketLots()
 
    //--- Clamp and normalise a raw lot to broker constraints
    double NormaliseLot(const string symbol, double rawLot) const
@@ -354,20 +358,29 @@ public:
         m_maxLot(RTE_DEFAULT_MAX_LOT),
         m_riskPercent(RTE_DEFAULT_RISK_PERCENT),
         m_hardStopUSD(RTE_DEFAULT_HARD_STOP_USD),
-        m_hardStopBreached(false) {}
+        m_hardStopBreached(false),
+        m_maxTotalLots(RTE_DEFAULT_MAX_TOTAL_LOTS),
+        m_basketLots(0.0) {}
 
    //--- Called from OnInit() after input parameters are available
    void Init(double maxSpreadPoints, double maxLot,
-             double riskPercent,     double hardStopUSD)
+             double riskPercent,     double hardStopUSD,
+             double maxTotalLots = RTE_DEFAULT_MAX_TOTAL_LOTS)
    {
       m_maxSpreadPoints = maxSpreadPoints;
       m_maxLot          = maxLot;
       m_riskPercent     = riskPercent;
       m_hardStopUSD     = hardStopUSD;
+      m_maxTotalLots    = maxTotalLots;
       m_logger.Info("RiskGuard",
-         StringFormat("Init — MaxSpread:%.0f pts  MaxLot:%.2f  Risk:%.2f%%  HardStop:%.2f USD",
-         maxSpreadPoints, maxLot, riskPercent, hardStopUSD));
+         StringFormat("Init — MaxSpread:%.0f pts  MaxLot:%.2f  Risk:%.2f%%  "
+                      "HardStop:%.2f USD  MaxTotalLots:%.2f",
+         maxSpreadPoints, maxLot, riskPercent, hardStopUSD, maxTotalLots));
    }
+
+   //--- Called by CRecoveryEngine after every basket snapshot.
+   //    Used by ValidateRequest() to enforce total exposure cap.
+   void SetBasketLots(double lots) { m_basketLots = lots; }
 
    //--- Returns true when current spread is within the configured limit
    bool IsSpreadAcceptable(const string symbol) const
@@ -450,6 +463,20 @@ public:
          return vr;
       }
 
+      // Global exposure cap: basket lots already open + new lot
+      if(m_maxTotalLots > 0.0 &&
+         (m_basketLots + req.lotSize) > m_maxTotalLots)
+      {
+         m_logger.Warn("RiskGuard",
+            StringFormat("Total exposure rejected — basket:%.2f + new:%.2f = %.2f  "
+                         "cap:%.2f  tag:%s",
+            m_basketLots, req.lotSize,
+            m_basketLots + req.lotSize, m_maxTotalLots, req.contextTag));
+         vr.isValid    = false;
+         vr.failReason = REJECT_TOTAL_EXPOSURE;
+         return vr;
+      }
+
       // Normalise (clamp to step) and surface adjusted value
       vr.isValid     = true;
       vr.failReason  = REJECT_NONE;
@@ -508,17 +535,22 @@ private:
    datetime    m_regTimes  [RTE_MAX_REGISTRY_SIZE];
    int         m_regCount;
 
-   //--- Monotonic counter used to tag each unique request internally
+   //--- Monotonic counters
    ulong       m_requestCounter;
+   int         m_cycleId;          // Incremented on every ClearRegistry(); baked into dedupe key
+   int         m_dedupeExpirySec;  // Registry entries older than this are treated as expired (0=never)
 
    // ── Dedupe helpers ────────────────────────────────────────────────
 
    //--- Build a deterministic key from fields that uniquely identify
    //    the trading intent within one basket lifecycle.
-   //    Format: {Symbol}|{OrderType}|{Direction}|{LotNorm}|{ContextTag}
+   //    Format: {CycleId}|{Symbol}|{OrderType}|{Direction}|{LotNorm}|{ContextTag}
+   //    CycleId ensures entries from a prior lifecycle can never collide with
+   //    the current one even if ClearRegistry() is somehow skipped.
    string BuildDedupeKey(const TradeRequest& req) const
    {
-      return StringFormat("%s|%d|%d|%.2f|%s",
+      return StringFormat("%d|%s|%d|%d|%.2f|%s",
+         m_cycleId,
          req.symbol,
          (int)req.orderType,
          (int)req.direction,
@@ -528,8 +560,20 @@ private:
 
    bool IsInRegistry(const string key) const
    {
+      datetime now = TimeCurrent();
       for(int i = 0; i < m_regCount; i++)
-         if(m_regKeys[i] == key) return true;
+      {
+         if(m_regKeys[i] != key) continue;
+         // Expired entries don't block retry — allows re-hedging after SL hit
+         if(m_dedupeExpirySec > 0 && (int)(now - m_regTimes[i]) > m_dedupeExpirySec)
+         {
+            m_logger.Debug("ExecEngine",
+               StringFormat("Dedupe entry expired (age:%ds) — allowing retry. key:%s",
+               (int)(now - m_regTimes[i]), key));
+            continue;
+         }
+         return true;
+      }
       return false;
    }
 
@@ -630,6 +674,10 @@ private:
          res.executedPrice = m_trade.ResultPrice();
          res.executedLot   = m_trade.ResultVolume();
          res.success       = true;
+         if(res.executedLot < req.lotSize - 0.001)
+            m_logger.Warn("ExecEngine",
+               StringFormat("PARTIAL FILL — requested:%.2f  filled:%.2f  tag:%s  ticket:%I64u",
+               req.lotSize, res.executedLot, req.contextTag, res.ticket));
          return true;
       }
 
@@ -695,19 +743,23 @@ public:
       : m_riskGuard(riskGuard),
         m_logger(logger),
         m_regCount(0),
-        m_requestCounter(0) {}
+        m_requestCounter(0),
+        m_cycleId(0),
+        m_dedupeExpirySec(3600) {}
 
    //--- Called from OnInit() after CTrade parameters are known
    void Init(int magicNumber, int slippagePoints,
-             ENUM_ORDER_TYPE_FILLING fillingMode = ORDER_FILLING_FOK)
+             ENUM_ORDER_TYPE_FILLING fillingMode = ORDER_FILLING_FOK,
+             int dedupeExpirySec = 3600)
    {
       m_trade.SetExpertMagicNumber(magicNumber);
       m_trade.SetDeviationInPoints(slippagePoints);
       m_trade.SetTypeFilling(fillingMode);
-      m_trade.LogLevel(LOG_LEVEL_ERRORS);          // Internal CTrade logging
+      m_trade.LogLevel(LOG_LEVEL_ERRORS);
+      m_dedupeExpirySec = dedupeExpirySec;
       m_logger.Info("ExecEngine",
-         StringFormat("Init — magic:%d slippage:%d pts filling:%s",
-         magicNumber, slippagePoints, EnumToString(fillingMode)));
+         StringFormat("Init — magic:%d slippage:%d pts filling:%s dedupeExpiry:%ds",
+         magicNumber, slippagePoints, EnumToString(fillingMode), dedupeExpirySec));
    }
 
    //--- Primary public interface.  All modules call ONLY this method.
@@ -756,8 +808,10 @@ public:
    //    Wipes registry so the next basket lifecycle starts clean.
    void ClearRegistry()
    {
+      m_cycleId++;   // New lifecycle → old keys can never collide with new submissions
       m_logger.Info("ExecEngine",
-         StringFormat("ClearRegistry — flushing %d entries.", m_regCount));
+         StringFormat("ClearRegistry — flushing %d entries  cycleId now:%d.",
+         m_regCount, m_cycleId));
       for(int i = 0; i < m_regCount; i++)
       {
          m_regKeys   [i] = "";
@@ -957,6 +1011,14 @@ public:
          }
          else
          {
+            // Refresh live fields — catches external partial closes
+            double liveLot = PositionGetDouble(POSITION_VOLUME);
+            if(liveLot < m_positions[i].lotSize - 0.001)
+               m_logger.Warn("OrderMgr",
+                  StringFormat("Ticket %I64u partially closed externally: "
+                               "was %.2f lot now %.2f lot",
+                  m_positions[i].ticket, m_positions[i].lotSize, liveLot));
+            m_positions[i].lotSize    = liveLot;
             m_positions[i].currentPnL = PositionGetDouble(POSITION_PROFIT);
             i++;
          }
@@ -1016,13 +1078,24 @@ public:
 
       for(int i = 0; i < count; i++)
       {
-         TradeResult res;
          string closeTag = StringFormat("CLOSE_%I64u", tickets[i]);
+         TradeResult res;
          if(!m_execEngine.SubmitClose(tickets[i], closeTag, res))
          {
-            m_logger.Error("OrderMgr",
-               StringFormat("CloseAll: failed to close ticket:%I64u — retcode:%d",
-               tickets[i], res.errorCode));
+            // Single immediate retry — catches transient broker hiccup
+            TradeResult res2;
+            if(m_execEngine.SubmitClose(tickets[i], closeTag, res2))
+            {
+               m_logger.Info("OrderMgr",
+                  StringFormat("CloseAll: ticket:%I64u closed on retry.", tickets[i]));
+            }
+            else
+            {
+               m_logger.Error("OrderMgr",
+                  StringFormat("CloseAll: ticket:%I64u failed both attempts — "
+                               "retcode:%d  retcode2:%d",
+                  tickets[i], res.errorCode, res2.errorCode));
+            }
          }
       }
    }
@@ -1818,6 +1891,8 @@ private:
 
    bool   m_hedgePlaced;
    ulong  m_hedgeTicket;
+   int    m_stepCount;      // Hedges placed this cycle
+   int    m_maxHedgeSteps;  // Hard cap — prevents grid runaway
 
    // ── Helpers ──────────────────────────────────────────────────────
 
@@ -1867,7 +1942,9 @@ private:
 
    void PlaceHedge(const BasketSnapshot& snap)
    {
-      if(m_hedgePlaced) return;
+      // Step cap enforced before anything else — prevents grid runaway
+      if(m_stepCount >= m_maxHedgeSteps)
+         return;
 
       ENUM_ORDER_TYPE dir = (snap.netDirection >= 0)
                             ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
@@ -1938,7 +2015,8 @@ private:
       req.takeProfit     = tp;
       req.stopLoss       = sl;
       req.isLotValidated = true;
-      req.contextTag     = "HEDGE_RANGE";
+      // Numbered tag ensures dedupe key is unique per step
+      req.contextTag     = StringFormat("HEDGE_RANGE_%d", m_stepCount + 1);
       req.magicNumber    = RTE_MAGIC_NUMBER;
 
       TradeResult res;
@@ -1946,11 +2024,13 @@ private:
       {
          m_hedgeTicket = res.ticket;
          m_hedgePlaced = true;
+         m_stepCount++;
          m_logger.Info("RangeRec",
-            StringFormat("Hedge placed — %s %.2f lot  TP:%.5f  rangeSize:%.5f  "
-                         "fibR:%.3f  ticket:%I64u",
+            StringFormat("Hedge placed step %d/%d — %s %.2f lot  TP:%.5f  SL:%.5f  "
+                         "rangeSize:%.5f  fibR:%.3f  ticket:%I64u",
+            m_stepCount, m_maxHedgeSteps,
             (dir == ORDER_TYPE_BUY ? "BUY" : "SELL"),
-            lot, tp, rangeSize, m_fibTPRatio, res.ticket));
+            lot, tp, sl, rangeSize, m_fibTPRatio, res.ticket));
       }
    }
 
@@ -1969,12 +2049,15 @@ public:
         m_lotRatio(1.0),
         m_maxLot(RTE_DEFAULT_MAX_LOT),
         m_hedgePlaced(false),
-        m_hedgeTicket(0) {}
+        m_hedgeTicket(0),
+        m_stepCount(0),
+        m_maxHedgeSteps(1) {}
 
    bool Init(const string symbol, ENUM_TIMEFRAMES tf,
              int rsiPeriod,     double rsiSellThresh, double rsiBuyThresh,
              int rangeLookback, double fibTPRatio,
-             double lotRatio,   double maxLot)
+             double lotRatio,   double maxLot,
+             int maxHedgeSteps = 1)
    {
       m_symbol        = symbol;
       m_timeframe     = tf;
@@ -1984,6 +2067,7 @@ public:
       m_rsiBuyThresh  = rsiBuyThresh;
       m_lotRatio      = lotRatio;
       m_maxLot        = maxLot;
+      m_maxHedgeSteps = (maxHedgeSteps > 0) ? maxHedgeSteps : 1;
 
       m_rsiHandle = iRSI(symbol, tf, rsiPeriod, PRICE_CLOSE);
       if(m_rsiHandle == INVALID_HANDLE)
@@ -1996,9 +2080,9 @@ public:
 
       m_logger.Info("RangeRec",
          StringFormat("Init — RSI(%d) sellThr:%.1f buyThr:%.1f "
-                      "range:%d bars  fibTP:%.3f  lotRatio:%.2f",
+                      "range:%d bars  fibTP:%.3f  lotRatio:%.2f  maxSteps:%d",
          rsiPeriod, rsiSellThresh, rsiBuyThresh,
-         rangeLookback, fibTPRatio, lotRatio));
+         rangeLookback, fibTPRatio, lotRatio, m_maxHedgeSteps));
       return true;
    }
 
@@ -2014,6 +2098,7 @@ public:
    {
       m_hedgePlaced = false;
       m_hedgeTicket = 0;
+      m_stepCount   = 0;
       m_logger.Debug("RangeRec", "Reset for new basket cycle.");
    }
 
@@ -2348,6 +2433,7 @@ private:
    //--- Counters reset per basket cycle
    int                m_closeAttempts;    // Ticks spent in STATE_CLOSE with positions still open
    int                m_detectingTicks;   // Ticks spent in STATE_DETECTING with REGIME_UNDETERMINED
+   int                m_entryAttempts;    // Ticks spent in STATE_ENTRY waiting for position confirmation
 
    // ─── State transition helper ─────────────────────────────────────
 
@@ -2417,16 +2503,35 @@ private:
 
    void OnEntry()
    {
+      // Re-attempt RegisterTicket in case broker confirmation was async on prior tick
+      if(m_orderMgr.GetPositionCount() == 0 && m_pendingTicket != 0)
+         m_orderMgr.RegisterTicket(m_pendingTicket, "ENTRY_CONFIRM");
+
       m_orderMgr.ReconcileWithBroker();
       if(m_orderMgr.GetPositionCount() > 0)
       {
+         m_entryAttempts = 0;
          SetState(STATE_MONITOR);
          return;
       }
+
+      m_entryAttempts++;
       m_logger.Warn("RecovEng",
-         "ENTRY: pending position not found after fill — returning to IDLE.");
-      m_pendingTicket = 0;
-      SetState(STATE_IDLE);
+         StringFormat("ENTRY: position not confirmed — attempt %d/%d  ticket:%I64u",
+         m_entryAttempts, Inp_MaxEntryConfirmTicks, m_pendingTicket));
+
+      if(m_entryAttempts >= Inp_MaxEntryConfirmTicks)
+      {
+         m_logger.Fatal("RecovEng",
+            StringFormat("ENTRY: position ticket:%I64u unconfirmed after %d ticks — "
+                         "aborting. Check broker manually.",
+            m_pendingTicket, Inp_MaxEntryConfirmTicks));
+         Alert(StringFormat("RecoveryTradeEngine: entry ticket %I64u not confirmed on %s.",
+               m_pendingTicket, m_symbol));
+         m_pendingTicket = 0;
+         m_entryAttempts = 0;
+         SetState(STATE_IDLE);
+      }
    }
 
    // ─── MONITOR ─────────────────────────────────────────────────────
@@ -2450,6 +2555,7 @@ private:
       }
 
       BasketSnapshot snap = m_orderMgr.GetBasketSnapshot();
+      m_riskGuard.SetBasketLots(snap.totalLots);   // Expose cap knows current basket size
       ENUM_BASKET_STATUS status = m_basketMon.Evaluate(snap);
 
       // Hard stop check (set inside CBasketMonitor::Evaluate as side-effect)
@@ -2536,6 +2642,7 @@ private:
 
       m_orderMgr.ReconcileWithBroker();
       BasketSnapshot snap = m_orderMgr.GetBasketSnapshot();
+      m_riskGuard.SetBasketLots(snap.totalLots);   // Keep exposure cap current
 
       // Side-effect: feeds P&L to CRiskGuard hard stop check
       m_basketMon.Evaluate(snap);
@@ -2622,6 +2729,7 @@ private:
       m_activeRegime   = REGIME_UNDETERMINED;
       m_closeAttempts  = 0;
       m_detectingTicks = 0;
+      m_entryAttempts  = 0;
       m_logger.Info("RecovEng", "Basket cycle reset complete.");
    }
 
@@ -2649,7 +2757,8 @@ public:
         m_pendingTicket(0),
         m_activeRegime(REGIME_UNDETERMINED),
         m_closeAttempts(0),
-        m_detectingTicks(0) {}
+        m_detectingTicks(0),
+        m_entryAttempts(0) {}
 
    void Init(const string symbol, double entryStopPoints,
              bool entryUseSL, int magic)
@@ -2709,11 +2818,12 @@ public:
 
 //--- Entry
 input group              "════ Entry Settings ════"
-input int              Inp_FastEMA         = RTE_DEFAULT_FAST_EMA;    // Fast EMA period
-input int              Inp_SlowEMA         = RTE_DEFAULT_SLOW_EMA;    // Slow EMA period
-input ENUM_TIMEFRAMES  Inp_Timeframe       = PERIOD_CURRENT;          // EMA timeframe (0 = chart TF)
-input int              Inp_EntryStopPoints = 200;                     // Stop distance (points) for lot sizing
-input bool             Inp_EntryUseSL      = false;                   // Place hard SL on entry order
+input int              Inp_FastEMA              = RTE_DEFAULT_FAST_EMA;  // Fast EMA period
+input int              Inp_SlowEMA              = RTE_DEFAULT_SLOW_EMA;  // Slow EMA period
+input ENUM_TIMEFRAMES  Inp_Timeframe            = PERIOD_CURRENT;        // EMA timeframe (0 = chart TF)
+input int              Inp_EntryStopPoints      = 200;                   // Stop distance (points) for lot sizing
+input bool             Inp_EntryUseSL           = false;                 // Place hard SL on entry order
+input int              Inp_MaxEntryConfirmTicks  = 3;                    // Ticks before unconfirmed entry aborts
 
 //--- Session Filter
 input group              "════ Session Filter ════"
@@ -2730,10 +2840,11 @@ input int    Inp_MaxDetectingTicks     = 20;                          // Ticks i
 
 //--- Risk
 input group              "════ Risk Settings ════"
-input double Inp_RiskPercent           = RTE_DEFAULT_RISK_PERCENT;    // % of balance per trade
-input double Inp_MaxLot                = RTE_DEFAULT_MAX_LOT;         // Hard lot cap
-input double Inp_MaxSpreadPoints       = RTE_DEFAULT_MAX_SPREAD;      // Max spread in points
-input ENUM_ORDER_TYPE_FILLING Inp_FillingMode = ORDER_FILLING_FOK;    // Order filling mode (FOK/IOC/Return)
+input double Inp_RiskPercent                  = RTE_DEFAULT_RISK_PERCENT;    // % of balance per trade
+input double Inp_MaxLot                       = RTE_DEFAULT_MAX_LOT;         // Hard lot cap per order
+input double Inp_MaxTotalExposureLots         = RTE_DEFAULT_MAX_TOTAL_LOTS;  // Max total basket lots across all positions
+input double Inp_MaxSpreadPoints              = RTE_DEFAULT_MAX_SPREAD;      // Max spread in points
+input ENUM_ORDER_TYPE_FILLING Inp_FillingMode = ORDER_FILLING_FOK;           // Order filling mode (FOK/IOC/Return)
 
 //--- Regime Detection
 input group              "════ Regime Detection ════"
@@ -2758,12 +2869,17 @@ input group              "════ Range Recovery ════"
 input int    Inp_RangeLookback         = 50;                          // Bars for swing H/L range
 input double Inp_RangeFibTPRatio       = RTE_DEFAULT_FIB_TP_RATIO;   // TP = rangeSize × ratio
 input double Inp_RangeLotRatio         = 1.0;                        // Hedge lot = basket lots × ratio
+input int    Inp_RangeMaxHedges        = 1;                          // Max range hedges per cycle (prevents grid runaway)
 
 //--- RSI (Range Recovery filter)
 input group              "════ RSI Settings ════"
 input int    Inp_RSIPeriod             = RTE_DEFAULT_RSI_PERIOD;
 input double Inp_RSI_OB                = RTE_DEFAULT_RSI_OB;          // Overbought → sell hedge
 input double Inp_RSI_OS                = RTE_DEFAULT_RSI_OS;          // Oversold   → buy hedge
+
+//--- Execution
+input group              "════ Execution ════"
+input int    Inp_DedupeExpirySec       = 3600;   // Seconds before a registry entry is considered expired (0=never)
 
 //--- Logging
 input group              "════ Logging ════"
@@ -2856,6 +2972,21 @@ int OnInit()
       g_logger.Fatal("EA", "ATRRatioThreshold must be > 0");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(Inp_MaxTotalExposureLots <= 0.0)
+   {
+      g_logger.Fatal("EA", "MaxTotalExposureLots must be > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(Inp_RangeMaxHedges < 1)
+   {
+      g_logger.Fatal("EA", "RangeMaxHedges must be >= 1");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   if(Inp_MaxEntryConfirmTicks < 1)
+   {
+      g_logger.Fatal("EA", "MaxEntryConfirmTicks must be >= 1");
+      return INIT_PARAMETERS_INCORRECT;
+   }
 
    //--- 3. Log validated configuration
    g_logger.Info("EA", StringFormat(
@@ -2875,11 +3006,13 @@ int OnInit()
    //--- 4. CRiskGuard
    g_riskGuard = new CRiskGuard(g_logger);
    g_riskGuard.Init(Inp_MaxSpreadPoints, Inp_MaxLot,
-                    Inp_RiskPercent,     Inp_HardStopUSD);
+                    Inp_RiskPercent,     Inp_HardStopUSD,
+                    Inp_MaxTotalExposureLots);
 
    //--- 5. CExecutionEngine (depends on CRiskGuard)
    g_execEngine = new CExecutionEngine(g_riskGuard, g_logger);
-   g_execEngine.Init(RTE_MAGIC_NUMBER, RTE_DEFAULT_SLIPPAGE, Inp_FillingMode);
+   g_execEngine.Init(RTE_MAGIC_NUMBER, RTE_DEFAULT_SLIPPAGE,
+                     Inp_FillingMode, Inp_DedupeExpirySec);
 
    //--- 6. COrderManager (depends on CExecutionEngine)
    g_orderMgr = new COrderManager(g_execEngine, g_logger);
@@ -2917,7 +3050,8 @@ int OnInit()
    if(!g_rangeRec.Init(_Symbol, Inp_Timeframe,
                        Inp_RSIPeriod,    Inp_RSI_OB,     Inp_RSI_OS,
                        Inp_RangeLookback, Inp_RangeFibTPRatio,
-                       Inp_RangeLotRatio, Inp_MaxLot))
+                       Inp_RangeLotRatio, Inp_MaxLot,
+                       Inp_RangeMaxHedges))
       return INIT_FAILED;
 
    //--- 12. CDashboardViewModel (depends on COrderManager + CRiskGuard)
