@@ -1096,10 +1096,126 @@ public:
 };
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 9 — CEntryEngine  [Phase 5]
+// SECTION 9 — CEntryEngine
+//  Responsibilities:
+//    • Create and manage two EMA indicator handles (fast + slow)
+//    • Detect crossover on last two COMPLETED bars (skips bar 0 — forming)
+//    • Return SIGNAL_BUY / SIGNAL_SELL / SIGNAL_NONE each tick
+//    • Release handles on Deinit()
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 5
+class CEntryEngine
+{
+private:
+   CLogger*         m_logger;
+   int              m_handleFast;
+   int              m_handleSlow;
+   int              m_fastPeriod;
+   int              m_slowPeriod;
+   string           m_symbol;
+   ENUM_TIMEFRAMES  m_timeframe;
+
+   //--- Read 3 values from a handle into a time-series buffer.
+   //    buf[0] = bar 0 (forming), buf[1] = bar 1 (last closed),
+   //    buf[2] = bar 2 (prior closed).
+   //    Returns false if data unavailable.
+   bool ReadBuffer(int handle, double& buf[]) const
+   {
+      ArraySetAsSeries(buf, true);
+      return CopyBuffer(handle, 0, 0, 3, buf) == 3;
+   }
+
+public:
+   CEntryEngine(CLogger* logger)
+      : m_logger(logger),
+        m_handleFast(INVALID_HANDLE),
+        m_handleSlow(INVALID_HANDLE),
+        m_fastPeriod(RTE_DEFAULT_FAST_EMA),
+        m_slowPeriod(RTE_DEFAULT_SLOW_EMA),
+        m_symbol(""),
+        m_timeframe(PERIOD_CURRENT) {}
+
+   //--- Creates indicator handles.  Returns false on failure.
+   bool Init(const string symbol, ENUM_TIMEFRAMES tf,
+             int fastPeriod, int slowPeriod)
+   {
+      m_symbol     = symbol;
+      m_timeframe  = tf;
+      m_fastPeriod = fastPeriod;
+      m_slowPeriod = slowPeriod;
+
+      m_handleFast = iMA(symbol, tf, fastPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      m_handleSlow = iMA(symbol, tf, slowPeriod, 0, MODE_EMA, PRICE_CLOSE);
+
+      if(m_handleFast == INVALID_HANDLE || m_handleSlow == INVALID_HANDLE)
+      {
+         m_logger.Fatal("EntryEng",
+            StringFormat("Failed to create EMA handles — fast:%d slow:%d err:%d",
+            fastPeriod, slowPeriod, GetLastError()));
+         return false;
+      }
+
+      m_logger.Info("EntryEng",
+         StringFormat("Init — %s %s  EMA(%d) x EMA(%d)",
+         symbol, EnumToString(tf), fastPeriod, slowPeriod));
+      return true;
+   }
+
+   //--- Evaluate crossover using bars 1 and 2 (both completed, not forming).
+   //    BUY  signal: fast was <= slow on bar 2, fast > slow on bar 1.
+   //    SELL signal: fast was >= slow on bar 2, fast < slow on bar 1.
+   ENUM_ENTRY_SIGNAL Evaluate() const
+   {
+      if(m_handleFast == INVALID_HANDLE || m_handleSlow == INVALID_HANDLE)
+         return SIGNAL_NONE;
+
+      double fastBuf[3], slowBuf[3];
+
+      if(!ReadBuffer(m_handleFast, fastBuf) ||
+         !ReadBuffer(m_handleSlow, slowBuf))
+      {
+         m_logger.Warn("EntryEng", "Evaluate: insufficient indicator data.");
+         return SIGNAL_NONE;
+      }
+
+      //--- bars[2] = older bar, bars[1] = last closed bar
+      double fast2 = fastBuf[2], slow2 = slowBuf[2];   // prior bar
+      double fast1 = fastBuf[1], slow1 = slowBuf[1];   // last closed bar
+
+      bool crossedUp   = (fast2 <= slow2) && (fast1 > slow1);
+      bool crossedDown = (fast2 >= slow2) && (fast1 < slow1);
+
+      if(crossedUp)
+      {
+         m_logger.Info("EntryEng",
+            StringFormat("BUY crossover — fast:%.5f > slow:%.5f", fast1, slow1));
+         return SIGNAL_BUY;
+      }
+      if(crossedDown)
+      {
+         m_logger.Info("EntryEng",
+            StringFormat("SELL crossover — fast:%.5f < slow:%.5f", fast1, slow1));
+         return SIGNAL_SELL;
+      }
+      return SIGNAL_NONE;
+   }
+
+   //--- Release MT5 indicator handles on EA deinit
+   void Deinit()
+   {
+      if(m_handleFast != INVALID_HANDLE)
+      {
+         IndicatorRelease(m_handleFast);
+         m_handleFast = INVALID_HANDLE;
+      }
+      if(m_handleSlow != INVALID_HANDLE)
+      {
+         IndicatorRelease(m_handleSlow);
+         m_handleSlow = INVALID_HANDLE;
+      }
+      m_logger.Debug("EntryEng", "Handles released.");
+   }
+};
 
 //══════════════════════════════════════════════════════════════════════
 // SECTION 10 — CRegimeDetector  [Phase 6]
@@ -1132,10 +1248,270 @@ public:
 // Implemented in Phase 9
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 15 — CRecoveryEngine  [Phase 10 — integration]
+// SECTION 15 — CRecoveryEngine
+//  State machine orchestrator.  The ONLY class that writes m_state.
+//  Phases 5 : IDLE, ENTRY, MONITOR, CLOSE fully wired.
+//  Phases 6+ : DETECTING and RECOVERY filled in progressively.
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 10
+class CRecoveryEngine
+{
+private:
+   //--- Module references (set in constructor; never NULL after Init)
+   CExecutionEngine*  m_execEngine;
+   COrderManager*     m_orderMgr;
+   CEntryEngine*      m_entryEngine;
+   CRiskGuard*        m_riskGuard;
+   CBasketMonitor*    m_basketMon;
+   CLogger*           m_logger;
+
+   //--- State machine — private; only methods of this class write it
+   ENUM_ENGINE_STATE  m_state;
+
+   //--- Entry parameters passed from OnInit
+   string             m_symbol;
+   double             m_entryStopPoints;  // For lot calculation
+   bool               m_entryUseSL;       // Whether to place a hard SL on entry order
+   int                m_magic;
+
+   //--- Tracks the ticket submitted in IDLE so ENTRY can confirm it
+   ulong              m_pendingTicket;
+
+   //--- Regime selected in DETECTING, consumed by RECOVERY (Phases 6/7)
+   ENUM_REGIME        m_activeRegime;
+
+   // ─── State transition helper ─────────────────────────────────────
+
+   void SetState(ENUM_ENGINE_STATE next)
+   {
+      if(next == m_state) return;
+      m_logger.Info("RecovEng",
+         StringFormat("State: %s → %s",
+         EnumToString(m_state), EnumToString(next)));
+      m_state = next;
+   }
+
+   // ─── IDLE ────────────────────────────────────────────────────────
+   //  Evaluate EMA crossover.  On signal: size lot, build TradeRequest,
+   //  submit via ExecutionEngine, register ticket, move to ENTRY.
+
+   void OnIdle()
+   {
+      ENUM_ENTRY_SIGNAL sig = m_entryEngine.Evaluate();
+      if(sig == SIGNAL_NONE) return;
+
+      // Spread guard before sizing
+      if(!m_riskGuard.IsSpreadAcceptable(m_symbol))
+      {
+         m_logger.Warn("RecovEng", "IDLE: spread too high — skipping entry.");
+         return;
+      }
+
+      double lot = m_riskGuard.ComputeLot(m_symbol, m_entryStopPoints);
+
+      TradeRequest req;
+      req.symbol         = m_symbol;
+      req.direction      = (sig == SIGNAL_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      req.orderType      = req.direction;
+      req.lotSize        = lot;
+      req.isLotValidated = true;
+      req.magicNumber    = m_magic;
+      req.contextTag     = (sig == SIGNAL_BUY) ? "ENTRY_BUY" : "ENTRY_SELL";
+
+      if(m_entryUseSL)
+      {
+         double price  = (sig == SIGNAL_BUY)
+                        ? SymbolInfoDouble(m_symbol, SYMBOL_ASK)
+                        : SymbolInfoDouble(m_symbol, SYMBOL_BID);
+         double slDist = m_entryStopPoints * _Point;
+         req.stopLoss  = (sig == SIGNAL_BUY) ? price - slDist : price + slDist;
+      }
+
+      TradeResult res;
+      if(!m_execEngine.Submit(req, res))
+      {
+         m_logger.Warn("RecovEng",
+            StringFormat("IDLE: entry submit failed reason:%d",
+            (int)res.rejectionReason));
+         return;
+      }
+
+      m_pendingTicket = res.ticket;
+      m_orderMgr.RegisterTicket(res.ticket, req.contextTag);
+      SetState(STATE_ENTRY);
+   }
+
+   // ─── ENTRY ───────────────────────────────────────────────────────
+   //  One-tick confirmation that the position is live.
+   //  Market orders fill synchronously, so this is almost always
+   //  a single tick.  Falls back to IDLE if position disappeared.
+
+   void OnEntry()
+   {
+      m_orderMgr.ReconcileWithBroker();
+      if(m_orderMgr.GetPositionCount() > 0)
+      {
+         SetState(STATE_MONITOR);
+         return;
+      }
+      m_logger.Warn("RecovEng",
+         "ENTRY: pending position not found after fill — returning to IDLE.");
+      m_pendingTicket = 0;
+      SetState(STATE_IDLE);
+   }
+
+   // ─── MONITOR ─────────────────────────────────────────────────────
+   //  Watch basket P&L every tick.
+   //  Hard stop  → CLOSE
+   //  Trigger    → DETECTING (Phase 6 fills this in)
+   //  No positions remain → IDLE (externally closed)
+
+   void OnMonitor()
+   {
+      m_orderMgr.ReconcileWithBroker();
+
+      // All positions gone (SL hit, manual close, etc.)
+      if(!m_orderMgr.HasOpenPositions())
+      {
+         m_logger.Info("RecovEng",
+            "MONITOR: no open positions — resetting to IDLE.");
+         ResetCycle();
+         SetState(STATE_IDLE);
+         return;
+      }
+
+      BasketSnapshot snap = m_orderMgr.GetBasketSnapshot();
+      ENUM_BASKET_STATUS status = m_basketMon.Evaluate(snap);
+
+      // Hard stop check (set inside CBasketMonitor::Evaluate as side-effect)
+      if(m_riskGuard.IsHardStopBreached())
+      {
+         m_logger.Fatal("RecovEng",
+            StringFormat("MONITOR: hard stop breached at %.2f USD — forcing CLOSE.",
+            snap.netPnlUSD));
+         SetState(STATE_CLOSE);
+         return;
+      }
+
+      if(status == BASKET_RECOVERY_TRIGGER)
+      {
+         SetState(STATE_DETECTING);   // Phase 6 implements OnDetecting()
+         return;
+      }
+   }
+
+   // ─── DETECTING ───────────────────────────────────────────────────
+   //  Phase 6: CRegimeDetector scores the market and sets m_activeRegime.
+   //  Stub until Phase 6.
+
+   void OnDetecting()
+   {
+      // Phase 6 — CRegimeDetector implemented here
+      m_logger.Warn("RecovEng",
+         "DETECTING: CRegimeDetector not yet implemented (Phase 6).");
+   }
+
+   // ─── RECOVERY ────────────────────────────────────────────────────
+   //  Phase 7/8: CTrendRecovery or CRangeRecovery dispatched here.
+   //  Stub until Phase 7.
+
+   void OnRecovery()
+   {
+      // Phase 7/8 — recovery modules implemented here
+      m_logger.Warn("RecovEng",
+         "RECOVERY: recovery modules not yet implemented (Phase 7/8).");
+   }
+
+   // ─── CLOSE ───────────────────────────────────────────────────────
+   //  Close all basket positions.  Retry each tick until empty.
+   //  Then reset everything and return to IDLE.
+
+   void OnClose()
+   {
+      m_orderMgr.CloseAll();
+      m_orderMgr.ReconcileWithBroker();
+
+      if(!m_orderMgr.HasOpenPositions())
+      {
+         m_logger.Info("RecovEng", "CLOSE: all positions confirmed closed.");
+         ResetCycle();
+         SetState(STATE_IDLE);
+      }
+      else
+      {
+         m_logger.Warn("RecovEng",
+            StringFormat("CLOSE: %d position(s) still open — retrying next tick.",
+            m_orderMgr.GetPositionCount()));
+      }
+   }
+
+   // ─── Cycle reset ─────────────────────────────────────────────────
+
+   void ResetCycle()
+   {
+      m_execEngine.ClearRegistry();
+      m_orderMgr.Reset();
+      m_basketMon.Reset();
+      m_riskGuard.ClearHardStop();
+      m_pendingTicket = 0;
+      m_activeRegime  = REGIME_UNDETERMINED;
+      m_logger.Info("RecovEng", "Basket cycle reset complete.");
+   }
+
+public:
+   CRecoveryEngine(CExecutionEngine* exec,
+                   COrderManager*    orderMgr,
+                   CEntryEngine*     entryEng,
+                   CRiskGuard*       riskGuard,
+                   CBasketMonitor*   basketMon,
+                   CLogger*          logger)
+      : m_execEngine(exec),
+        m_orderMgr(orderMgr),
+        m_entryEngine(entryEng),
+        m_riskGuard(riskGuard),
+        m_basketMon(basketMon),
+        m_logger(logger),
+        m_state(STATE_IDLE),
+        m_symbol(""),
+        m_entryStopPoints(200),
+        m_entryUseSL(false),
+        m_magic(RTE_MAGIC_NUMBER),
+        m_pendingTicket(0),
+        m_activeRegime(REGIME_UNDETERMINED) {}
+
+   void Init(const string symbol, double entryStopPoints,
+             bool entryUseSL, int magic)
+   {
+      m_symbol          = symbol;
+      m_entryStopPoints = entryStopPoints;
+      m_entryUseSL      = entryUseSL;
+      m_magic           = magic;
+      m_logger.Info("RecovEng",
+         StringFormat("Init — symbol:%s stopPts:%.0f useSL:%s magic:%d",
+         symbol, entryStopPoints,
+         (entryUseSL ? "true" : "false"), magic));
+   }
+
+   //--- Called exclusively from OnTick() in Section 16
+   void OnTick()
+   {
+      switch(m_state)
+      {
+         case STATE_IDLE:      OnIdle();      break;
+         case STATE_ENTRY:     OnEntry();     break;
+         case STATE_MONITOR:   OnMonitor();   break;
+         case STATE_DETECTING: OnDetecting(); break;
+         case STATE_RECOVERY:  OnRecovery();  break;
+         case STATE_CLOSE:     OnClose();     break;
+      }
+   }
+
+   ENUM_ENGINE_STATE GetState()   const { return m_state; }
+   ENUM_REGIME       GetRegime()  const { return m_activeRegime; }
+
+   //--- Used by CDashboardViewModel (Phase 9)
+   void SetActiveRegime(ENUM_REGIME r)   { m_activeRegime = r; }
+};
 
 //══════════════════════════════════════════════════════════════════════
 // SECTION 16 — INPUT PARAMETERS & EA ENTRY POINTS
@@ -1143,8 +1519,11 @@ public:
 
 //--- Entry
 input group              "════ Entry Settings ════"
-input int    Inp_FastEMA               = RTE_DEFAULT_FAST_EMA;        // Fast EMA period
-input int    Inp_SlowEMA               = RTE_DEFAULT_SLOW_EMA;        // Slow EMA period
+input int              Inp_FastEMA         = RTE_DEFAULT_FAST_EMA;    // Fast EMA period
+input int              Inp_SlowEMA         = RTE_DEFAULT_SLOW_EMA;    // Slow EMA period
+input ENUM_TIMEFRAMES  Inp_Timeframe       = PERIOD_CURRENT;          // EMA timeframe (0 = chart TF)
+input int              Inp_EntryStopPoints = 200;                     // Stop distance (points) for lot sizing
+input bool             Inp_EntryUseSL      = false;                   // Place hard SL on entry order
 
 //--- Recovery
 input group              "════ Recovery Settings ════"
@@ -1182,7 +1561,9 @@ CRiskGuard*       g_riskGuard   = NULL;
 CExecutionEngine* g_execEngine  = NULL;
 COrderManager*    g_orderMgr    = NULL;
 CBasketMonitor*   g_basketMon   = NULL;
-// Further pointers added per phase
+CEntryEngine*     g_entryEng    = NULL;
+CRecoveryEngine*  g_recovEng    = NULL;
+// Sections 10-14 pointers added per phase
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -1227,6 +1608,11 @@ int OnInit()
       g_logger.Fatal("EA", "RSI_OS must be less than RSI_OB");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(Inp_EntryStopPoints <= 0)
+   {
+      g_logger.Fatal("EA", "EntryStopPoints must be > 0");
+      return INIT_PARAMETERS_INCORRECT;
+   }
 
    //--- 3. Log validated configuration
    g_logger.Info("EA", StringFormat(
@@ -1260,18 +1646,30 @@ int OnInit()
    g_basketMon = new CBasketMonitor(g_riskGuard, g_logger);
    g_basketMon.Init(Inp_RecoveryActivationUSD);
 
-   //--- Phases 5-10: CEntryEngine, CRegimeDetector, CTrendRecovery,
-   //    CRangeRecovery, CDashboardViewModel, CDashboardRenderer,
-   //    CRecoveryEngine — instantiated as each phase is implemented.
+   //--- 8. CEntryEngine (depends on nothing except CLogger)
+   g_entryEng = new CEntryEngine(g_logger);
+   if(!g_entryEng.Init(_Symbol, Inp_Timeframe, Inp_FastEMA, Inp_SlowEMA))
+      return INIT_FAILED;
 
-   g_logger.Info("EA", "Phase 4 ready — OrderManager + BasketMonitor online.");
+   //--- 9. CRecoveryEngine (depends on all modules above)
+   g_recovEng = new CRecoveryEngine(
+      g_execEngine, g_orderMgr, g_entryEng,
+      g_riskGuard,  g_basketMon, g_logger);
+   g_recovEng.Init(_Symbol, Inp_EntryStopPoints, Inp_EntryUseSL, RTE_MAGIC_NUMBER);
+
+   //--- Phases 6-9: CRegimeDetector, CTrendRecovery, CRangeRecovery,
+   //    CDashboardViewModel, CDashboardRenderer
+   //    — passed into CRecoveryEngine as added each phase.
+
+   g_logger.Info("EA", "Phase 5 ready — EntryEngine + RecoveryEngine online.");
    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // CRecoveryEngine::OnTick() will be the sole call here (Phase 10)
+   if(g_recovEng != NULL)
+      g_recovEng.OnTick();
 }
 
 //+------------------------------------------------------------------+
@@ -1281,11 +1679,13 @@ void OnDeinit(const int reason)
       g_logger.Info("EA", StringFormat("OnDeinit. Reason: %d", reason));
 
    //--- Delete in reverse construction order
+   if(g_recovEng   != NULL) { delete g_recovEng;   g_recovEng   = NULL; }
+   if(g_entryEng   != NULL) { g_entryEng.Deinit(); delete g_entryEng; g_entryEng = NULL; }
    if(g_basketMon  != NULL) { delete g_basketMon;  g_basketMon  = NULL; }
    if(g_orderMgr   != NULL) { delete g_orderMgr;   g_orderMgr   = NULL; }
    if(g_execEngine != NULL) { delete g_execEngine; g_execEngine = NULL; }
    if(g_riskGuard  != NULL) { delete g_riskGuard;  g_riskGuard  = NULL; }
-   // Phases 5-10 pointers deleted here as they are added
+   // Phases 6-9 pointers deleted here as they are added
 
    if(g_logger != NULL) { delete g_logger; g_logger = NULL; }
 }
