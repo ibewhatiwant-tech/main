@@ -572,11 +572,12 @@ private:
       {
          if(m_regKeys[i] != key) continue;
          // Expired entries don't block retry — allows re-hedging after SL hit
-         if(m_dedupeExpirySec > 0 && (int)(now - m_regTimes[i]) > m_dedupeExpirySec)
+         datetime age = now - m_regTimes[i];
+         if(m_dedupeExpirySec > 0 && age > (datetime)m_dedupeExpirySec)
          {
             m_logger.Debug("ExecEngine",
                StringFormat("Dedupe entry expired (age:%ds) — allowing retry. key:%s",
-               (int)(now - m_regTimes[i]), key));
+               (int)age, key));
             continue;
          }
          return true;
@@ -1315,8 +1316,12 @@ private:
          dt.hour >= 17 && dt.hour < 18)
          return false;
 
-      // Pass-through when session filter is disabled
+      // Pass-through when session filter is disabled (both zero = no filter)
       if(m_sessionStartHour == 0 && m_sessionEndHour == 0)
+         return true;
+
+      // Equal non-zero hours would be a zero-width window — treat as disabled
+      if(m_sessionStartHour == m_sessionEndHour)
          return true;
 
       // Wrap-around sessions (e.g. 22:00–06:00) handled via OR
@@ -1838,6 +1843,14 @@ private:
       if(ticket == 0) return;
       if(!PositionSelectByTicket(ticket)) return;   // Already closed
 
+      // Guard against ticket reuse by another EA — only trail own positions
+      if((int)PositionGetInteger(POSITION_MAGIC) != RTE_MAGIC_NUMBER)
+      {
+         m_logger.Warn("TrendRec",
+            StringFormat("Trail skipped — ticket:%I64u magic mismatch.", ticket));
+         return;
+      }
+
       double atr = ReadATR();
       if(atr <= 0.0) return;
 
@@ -1846,6 +1859,9 @@ private:
       double currentSL = PositionGetDouble(POSITION_SL);
       double currentTP = PositionGetDouble(POSITION_TP);
       double trailDist = atr * m_atrMultiplier;
+
+      double tickSize = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
+      int    digits   = (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS);
 
       double newSL;
       if(posType == POSITION_TYPE_BUY)
@@ -1864,9 +1880,11 @@ private:
       }
 
       // Normalise to tick size
-      double tickSize = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_TICK_SIZE);
-      newSL = NormalizeDouble(MathRound(newSL / tickSize) * tickSize,
-                              (int)SymbolInfoInteger(m_symbol, SYMBOL_DIGITS));
+      newSL = NormalizeDouble(MathRound(newSL / tickSize) * tickSize, digits);
+
+      // Skip if normalised value equals current SL — avoids retcode 10025 "no changes" spam
+      if(currentSL > 0.0 && MathAbs(newSL - currentSL) < tickSize * 0.5)
+         return;
 
       TradeResult res;
       m_execEngine.SubmitModify(ticket, newSL, currentTP, tag, res);
@@ -1874,8 +1892,33 @@ private:
 
    void UpdateATRTrail()
    {
-      if(m_hedgePlaced) TrailPosition(m_hedgeTicket, "TRAIL_HEDGE");
-      if(m_contPlaced)  TrailPosition(m_contTicket,  "TRAIL_CONT");
+      if(m_hedgePlaced)
+      {
+         if(!PositionSelectByTicket(m_hedgeTicket))
+         {
+            // Position closed externally (TP/SL/manual) — allow re-hedge next tick
+            m_logger.Info("TrendRec",
+               StringFormat("Hedge ticket:%I64u gone externally — clearing placed flag.",
+               m_hedgeTicket));
+            m_hedgePlaced = false;
+            m_hedgeTicket = 0;
+         }
+         else
+            TrailPosition(m_hedgeTicket, "TRAIL_HEDGE");
+      }
+      if(m_contPlaced)
+      {
+         if(!PositionSelectByTicket(m_contTicket))
+         {
+            m_logger.Info("TrendRec",
+               StringFormat("Cont ticket:%I64u gone externally — clearing placed flag.",
+               m_contTicket));
+            m_contPlaced  = false;
+            m_contTicket  = 0;
+         }
+         else
+            TrailPosition(m_contTicket, "TRAIL_CONT");
+      }
    }
 
 public:
@@ -2038,6 +2081,16 @@ private:
 
    void PlaceHedge(const BasketSnapshot& snap)
    {
+      // If a previous hedge closed externally (TP hit), allow the next step
+      if(m_hedgePlaced && !PositionSelectByTicket(m_hedgeTicket))
+      {
+         m_logger.Info("RangeRec",
+            StringFormat("Hedge ticket:%I64u closed (TP/SL/external) — slot available for step %d.",
+            m_hedgeTicket, m_stepCount + 1));
+         m_hedgePlaced = false;
+         m_hedgeTicket = 0;
+      }
+
       // Step cap enforced before anything else — prevents grid runaway
       if(m_stepCount >= m_maxHedgeSteps)
          return;
@@ -2102,6 +2155,8 @@ private:
       else
          sl = NormalizeDouble(
               MathRound((entryPrice - rangeSize * 0.5) / tickSize) * tickSize, digits);
+      // If computed SL is at or below zero (extreme range), disable it — hard stop protects
+      if(sl <= 0.0) sl = 0.0;
 
       TradeRequest req;
       req.symbol         = m_symbol;
@@ -2636,7 +2691,10 @@ private:
    {
       // Re-attempt RegisterTicket in case broker confirmation was async on prior tick
       if(m_orderMgr.GetPositionCount() == 0 && m_pendingTicket != 0)
+      {
          m_orderMgr.RegisterTicket(m_pendingTicket, "ENTRY_CONFIRM");
+         m_pendingTicket = 0;   // Prevent repeated re-registration on subsequent ticks
+      }
 
       m_orderMgr.ReconcileWithBroker();
       if(m_orderMgr.GetPositionCount() > 0)
@@ -2773,6 +2831,17 @@ private:
 
       m_orderMgr.ReconcileWithBroker();
       BasketSnapshot snap = m_orderMgr.GetBasketSnapshot();
+
+      // If all positions closed externally (SL, manual, liquidation) while in RECOVERY,
+      // hedge lot would be 0 on next pass — treat basket as done and force CLOSE.
+      if(snap.positionCount == 0)
+      {
+         m_logger.Warn("RecovEng",
+            "RECOVERY: basket empty (all positions closed externally) → CLOSE.");
+         SetState(STATE_CLOSE);
+         return;
+      }
+
       m_riskGuard.SetBasketLots(snap.totalLots);   // Keep exposure cap current
 
       // Side-effect: feeds P&L to CRiskGuard hard stop check
