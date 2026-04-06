@@ -1943,16 +1943,285 @@ public:
 };
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 13 — CDashboardViewModel  [Phase 9]
+// SECTION 13 — CDashboardViewModel
+//  Responsibilities:
+//    • Aggregate EA state + basket metrics into one DashboardSnapshot
+//    • Zero MT5 API calls inside CRecoveryEngine — state passed in
+//    • Called by OnTick() AFTER g_recovEng.OnTick(); avoids circular dep
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 9
+class CDashboardViewModel
+{
+private:
+   COrderManager*  m_orderMgr;
+   CRiskGuard*     m_riskGuard;
+   CLogger*        m_logger;
+
+public:
+   CDashboardViewModel(COrderManager* orderMgr,
+                       CRiskGuard*    riskGuard,
+                       CLogger*       logger)
+      : m_orderMgr(orderMgr),
+        m_riskGuard(riskGuard),
+        m_logger(logger) {}
+
+   //--- Build a fresh DashboardSnapshot.
+   //    state and regime come from CRecoveryEngine::GetState/GetRegime()
+   //    so this class never needs to hold a back-pointer to CRecoveryEngine.
+   DashboardSnapshot Refresh(ENUM_ENGINE_STATE state, ENUM_REGIME regime)
+   {
+      DashboardSnapshot snap;
+      snap.engineState          = state;
+      snap.regimeClassification = regime;
+      snap.tickTime             = TimeCurrent();
+      snap.lastLogMessage       = m_logger.GetLastMessage();
+      snap.hardStopBreached     = m_riskGuard.IsHardStopBreached();
+      snap.recoveryActive       = (state == STATE_RECOVERY);
+
+      BasketSnapshot basket     = m_orderMgr.GetBasketSnapshot();
+      snap.basketNetPnL         = basket.netPnlUSD;
+      snap.positionCount        = basket.positionCount;
+
+      // Spread stored as raw broker points (SYMBOL_SPREAD integer)
+      snap.spreadCurrentPips    = (double)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+
+      return snap;
+   }
+};
 
 //══════════════════════════════════════════════════════════════════════
-// SECTION 14 — CDashboardRenderer  [Phase 9]
+// SECTION 14 — CDashboardRenderer
+//  Responsibilities:
+//    • Create OBJ_LABEL chart objects on Init()
+//    • Update text + colour each tick via Render(DashboardSnapshot)
+//    • Fall back to Comment() if ObjectCreate fails
+//    • Remove all chart objects on Deinit()
+//
+//  Layout (top-left corner, Consolas 9pt):
+//    Row 0 — title bar
+//    Row 1 — State
+//    Row 2 — Regime
+//    Row 3 — Basket P&L + position count
+//    Row 4 — Spread
+//    Row 5 — Hard Stop flag
+//    Row 6 — Last log message (truncated)
 //══════════════════════════════════════════════════════════════════════
 
-// Implemented in Phase 9
+class CDashboardRenderer
+{
+private:
+   CLogger*  m_logger;
+   string    m_prefix;        // Unique per EA instance: "RTE_{magic}_"
+   bool      m_useObjects;    // Falls to Comment() when false
+   int       m_xBase;
+   int       m_yBase;
+   int       m_rowH;          // Vertical gap between rows (pixels)
+   int       m_fontSize;
+
+   //--- Object name builder
+   string N(const string suffix) const { return m_prefix + suffix; }
+
+   // ── Label lifecycle ───────────────────────────────────────────────
+
+   bool CreateLabel(const string name, int row) const
+   {
+      if(!ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+      {
+         // Object may already exist from a previous attach — try resetting
+         if(ObjectFind(0, name) < 0) return false;
+      }
+      ObjectSetInteger(0, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, m_xBase);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, m_yBase + row * m_rowH);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE,  m_fontSize);
+      ObjectSetString (0, name, OBJPROP_FONT,      "Consolas");
+      ObjectSetInteger(0, name, OBJPROP_BACK,      false);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,    true);
+      return true;
+   }
+
+   void SetLabel(const string name, const string text, color clr) const
+   {
+      if(ObjectFind(0, name) >= 0)
+      {
+         ObjectSetString (0, name, OBJPROP_TEXT,  text);
+         ObjectSetInteger(0, name, OBJPROP_COLOR, (long)clr);
+      }
+   }
+
+   // ── Colour helpers ────────────────────────────────────────────────
+
+   color StateColor(ENUM_ENGINE_STATE s) const
+   {
+      switch(s)
+      {
+         case STATE_IDLE:      return clrSilver;
+         case STATE_ENTRY:     return clrYellow;
+         case STATE_MONITOR:   return clrCyan;
+         case STATE_DETECTING: return clrOrange;
+         case STATE_RECOVERY:  return clrTomato;
+         case STATE_CLOSE:     return clrOrchid;
+         default:              return clrWhite;
+      }
+   }
+
+   color RegimeColor(ENUM_REGIME r) const
+   {
+      switch(r)
+      {
+         case REGIME_TREND:        return clrLime;
+         case REGIME_RANGE:        return clrDeepSkyBlue;
+         case REGIME_UNDETERMINED: return clrSilver;
+         default:                  return clrWhite;
+      }
+   }
+
+   // ── String helpers ────────────────────────────────────────────────
+
+   string StateName(ENUM_ENGINE_STATE s) const
+   {
+      switch(s)
+      {
+         case STATE_IDLE:      return "IDLE";
+         case STATE_ENTRY:     return "ENTRY";
+         case STATE_MONITOR:   return "MONITOR";
+         case STATE_DETECTING: return "DETECTING";
+         case STATE_RECOVERY:  return "RECOVERY";
+         case STATE_CLOSE:     return "CLOSE";
+         default:              return "?";
+      }
+   }
+
+   string RegimeName(ENUM_REGIME r) const
+   {
+      switch(r)
+      {
+         case REGIME_TREND:        return "TREND";
+         case REGIME_RANGE:        return "RANGE";
+         case REGIME_UNDETERMINED: return "---";
+         default:                  return "?";
+      }
+   }
+
+   //--- Build the Comment() fallback string
+   string BuildCommentText(const DashboardSnapshot& s) const
+   {
+      return StringFormat(
+         "═══ RecoveryTradeEngine v%s ═══\n"
+         "State  : %-10s\n"
+         "Regime : %-10s\n"
+         "P&L    : %+.2f USD  [%d pos]\n"
+         "Spread : %.0f pts\n"
+         "HStop  : %s\n"
+         "Log    : %s",
+         RTE_VERSION_STRING,
+         StateName(s.engineState),
+         RegimeName(s.regimeClassification),
+         s.basketNetPnL, s.positionCount,
+         s.spreadCurrentPips,
+         (s.hardStopBreached ? "*** BREACHED ***" : "OK"),
+         StringSubstr(s.lastLogMessage, 0, 80));
+   }
+
+public:
+   CDashboardRenderer(CLogger* logger)
+      : m_logger(logger),
+        m_prefix(""),
+        m_useObjects(true),
+        m_xBase(10),
+        m_yBase(20),
+        m_rowH(18),
+        m_fontSize(9) {}
+
+   //--- Create all label objects.  Falls back to Comment() silently on failure.
+   void Init(int magicNumber)
+   {
+      m_prefix = StringFormat("RTE_%d_", magicNumber);
+
+      bool ok = CreateLabel(N("TITLE"),  0)
+             && CreateLabel(N("STATE"),  1)
+             && CreateLabel(N("REGIME"), 2)
+             && CreateLabel(N("PNL"),    3)
+             && CreateLabel(N("SPREAD"), 4)
+             && CreateLabel(N("HSTOP"),  5)
+             && CreateLabel(N("LOG"),    6);
+
+      if(!ok)
+      {
+         m_useObjects = false;
+         m_logger.Warn("Renderer",
+            "Failed to create chart objects — using Comment() fallback.");
+      }
+      else
+      {
+         // Initialise title (static)
+         SetLabel(N("TITLE"),
+            StringFormat("═══ RecoveryTradeEngine v%s  [%s] ═══",
+            RTE_VERSION_STRING, _Symbol),
+            clrGold);
+         m_logger.Info("Renderer", "Chart labels created.");
+      }
+
+      ChartRedraw(0);
+   }
+
+   //--- Update all labels with the latest snapshot.  Called every tick.
+   void Render(const DashboardSnapshot& snap)
+   {
+      if(!m_useObjects)
+      {
+         Comment(BuildCommentText(snap));
+         return;
+      }
+
+      //--- State
+      SetLabel(N("STATE"),
+         StringFormat("State  : %-10s", StateName(snap.engineState)),
+         StateColor(snap.engineState));
+
+      //--- Regime
+      SetLabel(N("REGIME"),
+         StringFormat("Regime : %-10s", RegimeName(snap.regimeClassification)),
+         RegimeColor(snap.regimeClassification));
+
+      //--- P&L
+      color pnlClr = (snap.basketNetPnL >= 0.0) ? clrLime : clrTomato;
+      SetLabel(N("PNL"),
+         StringFormat("P&L    : %+.2f USD   [%d pos]",
+         snap.basketNetPnL, snap.positionCount),
+         pnlClr);
+
+      //--- Spread
+      color spClr = (snap.spreadCurrentPips <= RTE_DEFAULT_MAX_SPREAD)
+                    ? clrSilver : clrOrange;
+      SetLabel(N("SPREAD"),
+         StringFormat("Spread : %.0f pts", snap.spreadCurrentPips),
+         spClr);
+
+      //--- Hard stop
+      color hsClr  = snap.hardStopBreached ? clrRed    : clrSilver;
+      string hsTxt = snap.hardStopBreached ? "HStop  : *** BREACHED ***"
+                                           : "HStop  : OK";
+      SetLabel(N("HSTOP"), hsTxt, hsClr);
+
+      //--- Last log (strip timestamp prefix, truncate to 70 chars)
+      string logTxt = StringSubstr(snap.lastLogMessage, 0, 70);
+      SetLabel(N("LOG"), logTxt, clrDarkGray);
+
+      ChartRedraw(0);
+   }
+
+   //--- Remove all EA label objects from the chart
+   void Deinit()
+   {
+      string names[] = {"TITLE","STATE","REGIME","PNL","SPREAD","HSTOP","LOG"};
+      for(int i = 0; i < ArraySize(names); i++)
+         ObjectDelete(0, N(names[i]));
+      Comment("");
+      m_logger.Debug("Renderer", "Chart labels removed.");
+   }
+};
 
 //══════════════════════════════════════════════════════════════════════
 // SECTION 15 — CRecoveryEngine
@@ -2384,10 +2653,11 @@ COrderManager*    g_orderMgr    = NULL;
 CBasketMonitor*   g_basketMon   = NULL;
 CEntryEngine*     g_entryEng    = NULL;
 CRegimeDetector*  g_regimeDet   = NULL;
-CTrendRecovery*   g_trendRec    = NULL;
-CRangeRecovery*   g_rangeRec    = NULL;
-CRecoveryEngine*  g_recovEng    = NULL;
-// Sections 13-14 pointers added per phase
+CTrendRecovery*      g_trendRec    = NULL;
+CRangeRecovery*      g_rangeRec    = NULL;
+CDashboardViewModel* g_dashVM      = NULL;
+CDashboardRenderer*  g_dashRend    = NULL;
+CRecoveryEngine*     g_recovEng    = NULL;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -2508,10 +2778,23 @@ int OnInit()
    g_recovEng.SetTrendRecovery(g_trendRec);
    g_recovEng.SetRangeRecovery(g_rangeRec);
 
-   //--- Phase 9: CDashboardViewModel + CDashboardRenderer
-   //    — injected into CRecoveryEngine as added next phase.
+   //--- 13. CDashboardViewModel (depends on COrderManager + CRiskGuard)
+   g_dashVM = new CDashboardViewModel(g_orderMgr, g_riskGuard, g_logger);
 
-   g_logger.Info("EA", "Phase 8 ready — RangeRecovery online, both RECOVERY paths active.");
+   //--- 14. CDashboardRenderer
+   g_dashRend = new CDashboardRenderer(g_logger);
+   g_dashRend.Init(RTE_MAGIC_NUMBER);
+
+   //--- 15. CRecoveryEngine (depends on all modules above)
+   g_recovEng = new CRecoveryEngine(
+      g_execEngine, g_orderMgr, g_entryEng,
+      g_riskGuard,  g_basketMon, g_logger);
+   g_recovEng.Init(_Symbol, Inp_EntryStopPoints, Inp_EntryUseSL, RTE_MAGIC_NUMBER);
+   g_recovEng.SetRegimeDetector(g_regimeDet);
+   g_recovEng.SetTrendRecovery(g_trendRec);
+   g_recovEng.SetRangeRecovery(g_rangeRec);
+
+   g_logger.Info("EA", "Phase 9 ready — Dashboard online. All modules active.");
    return INIT_SUCCEEDED;
 }
 
@@ -2520,6 +2803,15 @@ void OnTick()
 {
    if(g_recovEng != NULL)
       g_recovEng.OnTick();
+
+   // Dashboard refreshed every tick after state machine runs
+   if(g_dashVM != NULL && g_dashRend != NULL && g_recovEng != NULL)
+   {
+      DashboardSnapshot snap = g_dashVM.Refresh(
+         g_recovEng.GetState(),
+         g_recovEng.GetRegime());
+      g_dashRend.Render(snap);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -2529,16 +2821,18 @@ void OnDeinit(const int reason)
       g_logger.Info("EA", StringFormat("OnDeinit. Reason: %d", reason));
 
    //--- Delete in reverse construction order
-   if(g_recovEng   != NULL) { delete g_recovEng;                         g_recovEng   = NULL; }
-   if(g_trendRec   != NULL) { g_trendRec.Deinit();   delete g_trendRec;  g_trendRec   = NULL; }
-   if(g_rangeRec   != NULL) { g_rangeRec.Deinit();   delete g_rangeRec;  g_rangeRec   = NULL; }
-   if(g_regimeDet  != NULL) { g_regimeDet.Deinit();  delete g_regimeDet; g_regimeDet  = NULL; }
-   if(g_entryEng   != NULL) { g_entryEng.Deinit();   delete g_entryEng;  g_entryEng   = NULL; }
-   if(g_basketMon  != NULL) { delete g_basketMon;  g_basketMon  = NULL; }
-   if(g_orderMgr   != NULL) { delete g_orderMgr;   g_orderMgr   = NULL; }
-   if(g_execEngine != NULL) { delete g_execEngine; g_execEngine = NULL; }
-   if(g_riskGuard  != NULL) { delete g_riskGuard;  g_riskGuard  = NULL; }
-   // Phase 9 pointers deleted here as added
+   //--- Reverse construction order
+   if(g_recovEng  != NULL) { delete g_recovEng;                          g_recovEng  = NULL; }
+   if(g_dashRend  != NULL) { g_dashRend.Deinit();  delete g_dashRend;    g_dashRend  = NULL; }
+   if(g_dashVM    != NULL) { delete g_dashVM;                            g_dashVM    = NULL; }
+   if(g_trendRec  != NULL) { g_trendRec.Deinit();  delete g_trendRec;   g_trendRec  = NULL; }
+   if(g_rangeRec  != NULL) { g_rangeRec.Deinit();  delete g_rangeRec;   g_rangeRec  = NULL; }
+   if(g_regimeDet != NULL) { g_regimeDet.Deinit(); delete g_regimeDet;  g_regimeDet = NULL; }
+   if(g_entryEng  != NULL) { g_entryEng.Deinit();  delete g_entryEng;   g_entryEng  = NULL; }
+   if(g_basketMon != NULL) { delete g_basketMon;   g_basketMon = NULL; }
+   if(g_orderMgr  != NULL) { delete g_orderMgr;    g_orderMgr  = NULL; }
+   if(g_execEngine!= NULL) { delete g_execEngine;  g_execEngine= NULL; }
+   if(g_riskGuard != NULL) { delete g_riskGuard;   g_riskGuard = NULL; }
 
    if(g_logger != NULL) { delete g_logger; g_logger = NULL; }
 }
