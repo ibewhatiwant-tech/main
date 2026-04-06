@@ -924,7 +924,7 @@ public:
       PositionRecord rec;
       rec.ticket     = ticket;
       rec.direction  = (ENUM_ORDER_TYPE)PositionGetInteger(POSITION_TYPE);
-      rec.openPrice  = PositionGetDouble(POSITION_OPEN_PRICE);
+      rec.openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
       rec.lotSize    = PositionGetDouble(POSITION_VOLUME);
       rec.openTime   = (datetime)PositionGetInteger(POSITION_TIME);
       rec.contextTag = contextTag;
