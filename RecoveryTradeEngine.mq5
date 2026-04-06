@@ -2596,6 +2596,7 @@ private:
    int                m_maxEntryConfirmTicks;  // Abort entry after this many unconfirmed ticks
    int                m_maxDetectingTicks;     // Force CLOSE after this many undetermined-regime ticks
    int                m_maxCloseAttempts;      // Force cycle reset after this many failed close ticks
+   double             m_recoveryTargetUSD;     // Minimum basket net P&L (USD) to trigger CLOSE (default 0 = breakeven)
 
    // ─── State transition helper ─────────────────────────────────────
 
@@ -2847,12 +2848,12 @@ private:
       // Side-effect: feeds P&L to CRiskGuard hard stop check
       m_basketMon.Evaluate(snap);
 
-      // Goal: basket P_net >= 0 → close everything
-      if(snap.netPnlUSD >= 0.0)
+      // Goal: basket net P&L reaches configured target (default 0 = breakeven)
+      if(snap.netPnlUSD >= m_recoveryTargetUSD)
       {
          m_logger.Info("RecovEng",
-            StringFormat("RECOVERY complete — basket P&L: +%.2f USD → CLOSE.",
-            snap.netPnlUSD));
+            StringFormat("RECOVERY complete — basket P&L: %.2f USD  target: %.2f USD → CLOSE.",
+            snap.netPnlUSD, m_recoveryTargetUSD));
          SetState(STATE_CLOSE);
          return;
       }
@@ -2976,7 +2977,8 @@ public:
         m_targetMagic(0),
         m_maxEntryConfirmTicks(3),
         m_maxDetectingTicks(20),
-        m_maxCloseAttempts(10) {}
+        m_maxCloseAttempts(10),
+        m_recoveryTargetUSD(0.0) {}
 
    void Init(const string symbol, double entryStopPoints,
              bool entryUseSL, int magic)
@@ -3048,6 +3050,19 @@ public:
          m_maxEntryConfirmTicks, m_maxDetectingTicks, m_maxCloseAttempts));
    }
 
+   //--- Set the minimum basket net P&L (USD) required to trigger STATE_CLOSE.
+   //    0.0 = breakeven (default).  Positive values lock in a profit target.
+   //    Negative values close early even while still in loss (not recommended).
+   void SetRecoveryTarget(double targetUSD)
+   {
+      m_recoveryTargetUSD = targetUSD;
+      m_logger.Info("RecovEng",
+         StringFormat("RecoveryTarget — %.2f USD (%s)",
+         targetUSD,
+         (targetUSD > 0.0 ? "profit target" :
+          targetUSD < 0.0 ? "early-loss close" : "breakeven")));
+   }
+
    ENUM_ENGINE_STATE GetState()   const { return m_state; }
    ENUM_REGIME       GetRegime()  const { return m_activeRegime; }
 };
@@ -3084,6 +3099,7 @@ input bool             Inp_BlockSundayRollover = true;  // Block entries 17:00�
 input group              "════ Recovery Settings ════"
 input double Inp_RecoveryActivationUSD = RTE_DEFAULT_RECOVERY_USD;    // USD drawdown to trigger recovery
 input double Inp_HardStopUSD           = RTE_DEFAULT_HARD_STOP_USD;   // USD loss → force close all
+input double Inp_RecoveryTargetUSD     = 0.0;                         // Basket net P&L target to close (0 = breakeven)
 input int    Inp_MaxCloseAttempts      = 10;                          // Ticks in STATE_CLOSE before forced reset + alert
 input int    Inp_MaxDetectingTicks     = 20;                          // Ticks in STATE_DETECTING before forcing CLOSE
 
@@ -3227,6 +3243,13 @@ int OnInit()
       g_logger.Fatal("EA", "MaxTotalExposureLots must be > 0");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(Inp_RecoveryTargetUSD >= Inp_HardStopUSD)
+   {
+      g_logger.Fatal("EA", StringFormat(
+         "RecoveryTargetUSD (%.2f) must be less than HardStopUSD (%.2f)",
+         Inp_RecoveryTargetUSD, Inp_HardStopUSD));
+      return INIT_PARAMETERS_INCORRECT;
+   }
    if(Inp_RangeMaxHedges < 1)
    {
       g_logger.Fatal("EA", "RangeMaxHedges must be >= 1");
@@ -3328,6 +3351,7 @@ int OnInit()
    g_recovEng.Init(_Symbol, Inp_EntryStopPoints, Inp_EntryUseSL, RTE_MAGIC_NUMBER);
    g_recovEng.SetRecoveryMode(Inp_RecoveryMode, Inp_TargetMagic);
    g_recovEng.SetLimits(Inp_MaxEntryConfirmTicks, Inp_MaxDetectingTicks, Inp_MaxCloseAttempts);
+   g_recovEng.SetRecoveryTarget(Inp_RecoveryTargetUSD);
    g_recovEng.SetRegimeDetector(g_regimeDet);
    g_recovEng.SetTrendRecovery(g_trendRec);
    g_recovEng.SetRangeRecovery(g_rangeRec);
