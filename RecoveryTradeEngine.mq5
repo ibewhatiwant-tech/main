@@ -1938,6 +1938,9 @@ public:
       m_logger.Debug("TrendRec", "Reset for new basket cycle.");
    }
 
+   ulong GetHedgeTicket() const { return m_hedgeTicket; }
+   ulong GetContTicket()  const { return m_contTicket;  }
+
    void Deinit()
    {
       if(m_atrHandle != INVALID_HANDLE)
@@ -2194,6 +2197,8 @@ public:
       m_stepCount   = 0;
       m_logger.Debug("RangeRec", "Reset for new basket cycle.");
    }
+
+   ulong GetHedgeTicket() const { return m_hedgeTicket; }
 
    void Deinit()
    {
@@ -2787,7 +2792,15 @@ private:
       if(m_activeRegime == REGIME_TREND)
       {
          if(m_trendRecovery != NULL)
+         {
             m_trendRecovery.Process(snap);
+            // Register recovery tickets so CloseAll() includes them in the basket.
+            // RegisterTicket is idempotent — safe to call every tick.
+            ulong ht = m_trendRecovery.GetHedgeTicket();
+            ulong ct = m_trendRecovery.GetContTicket();
+            if(ht != 0) m_orderMgr.RegisterTicket(ht, "HEDGE_TREND");
+            if(ct != 0) m_orderMgr.RegisterTicket(ct, "CONT_TREND");
+         }
          else
             m_logger.Warn("RecovEng",
                "RECOVERY(TREND): CTrendRecovery not wired (Phase 7).");
@@ -2795,7 +2808,12 @@ private:
       else if(m_activeRegime == REGIME_RANGE)
       {
          if(m_rangeRecovery != NULL)
+         {
             m_rangeRecovery.Process(snap);
+            // Register recovery ticket so CloseAll() includes it in the basket.
+            ulong ht = m_rangeRecovery.GetHedgeTicket();
+            if(ht != 0) m_orderMgr.RegisterTicket(ht, "HEDGE_RANGE");
+         }
          else
             m_logger.Warn("RecovEng",
                "RECOVERY(RANGE): CRangeRecovery not wired (Phase 8).");
