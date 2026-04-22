@@ -306,10 +306,7 @@ void ScanClosedDeals()
 
       //--- Only interested in position-closing deals
       if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT)
-        {
-         g_lastProcessedTicket = ticket;   // advance marker even for non-close deals
          continue;
-        }
 
       datetime dealTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
       double   profit   = HistoryDealGetDouble(ticket, DEAL_PROFIT)

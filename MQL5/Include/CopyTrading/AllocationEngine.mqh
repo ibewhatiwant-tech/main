@@ -335,7 +335,8 @@ double CAllocationEngine::CalculateMultiplier(string symbol, double masterLots)
 //|                                                                  |
 //| Where:                                                           |
 //|   riskAmount  = equity * riskPercent / 100                       |
-//|   slPips      = |signal.price - signal.stopLoss| / (point * 10)  |
+//|   slPips      = |signal.price - signal.stopLoss| / (point * pipDivisor) |
+//|   pipDivisor  = 10 for 3/5-digit symbols; 1 otherwise             |
 //|   pipValue    = CMT5Wrapper::GetPipValue (per 1.0 standard lot)  |
 //|                                                                  |
 //| Falls back to m_fallbackFixed when:                              |
@@ -375,7 +376,9 @@ double CAllocationEngine::CalculateRiskBased(const CSignal &signal)
       return FallbackLot(signal.symbol);
      }
 
-   double slPips = MathAbs(signal.price - signal.stopLoss) / (point * 10.0);
+   long digits = SymbolInfoInteger(signal.symbol, SYMBOL_DIGITS);
+   double pipDivisor = (digits == 3 || digits == 5) ? 10.0 : 1.0;
+   double slPips = MathAbs(signal.price - signal.stopLoss) / (point * pipDivisor);
 
    if(slPips < 1.0)
      {

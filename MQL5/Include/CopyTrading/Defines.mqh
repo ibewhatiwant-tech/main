@@ -99,9 +99,9 @@ struct SDailyStats
 //+------------------------------------------------------------------+
 #define CT_VERSION              "1.0.0"
 #define CT_MAGIC_NUMBER         20251230
-#define CT_SIGNAL_DIR           "CopyTrading\\Signals\\"
-#define CT_LOG_DIR              "CopyTrading\\Logs\\"
-#define CT_STATE_DIR            "CopyTrading\\State\\"
+#define CT_SIGNAL_DIR           "CopyTrading/Signals/"
+#define CT_LOG_DIR              "CopyTrading/Logs/"
+#define CT_STATE_DIR            "CopyTrading/State/"
 #define CT_MAX_QUEUE_SIZE       100
 #define CT_SIGNAL_MAX_AGE       300        // 5 minutes (seconds)
 #define CT_HEARTBEAT_SECS       5          // Heartbeat interval

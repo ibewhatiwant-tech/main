@@ -175,6 +175,12 @@ int OnInit()
      }
    g_logger.Info("Signal receiver initialized, watching master: " + InpMasterSignalID);
 
+   //--- Initialize performance tracker
+   if(!g_perfTracker.Init(&g_logger, g_followerId, false))
+     {
+      g_logger.Warn("Failed to initialize PerformanceTracker (non-fatal)");
+     }
+
    //--- Initialize trade replicator
    if(!g_replicator.Init(&g_logger, &g_mt5, &g_allocEngine, &g_riskMgr,
                           &g_perfTracker,
@@ -190,12 +196,6 @@ int OnInit()
    g_replicator.SetDirectionFilter(InpDirFilter);
    if(InpSymbolMap != "")
       g_replicator.SetSymbolMap(InpSymbolMap);
-
-   //--- Initialize performance tracker
-   if(!g_perfTracker.Init(&g_logger, g_followerId, false))
-     {
-      g_logger.Warn("Failed to initialize PerformanceTracker (non-fatal)");
-     }
 
    //--- Parse time filter
    if(InpEnableTimeFilter)

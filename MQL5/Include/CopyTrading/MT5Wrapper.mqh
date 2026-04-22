@@ -582,8 +582,8 @@ double CMT5Wrapper::NormalizeLotSize(string symbol, double lots)
    if(minLot <= 0.0) minLot = CT_LOT_MIN_DEFAULT;
    if(maxLot <= 0.0) maxLot = CT_LOT_MAX_DEFAULT;
 
-   // Round to nearest step
-   lots = MathRound(lots / step) * step;
+   // Round down to step to avoid exceeding intended risk
+   lots = MathFloor(lots / step) * step;
 
    // Clamp within [min, max]
    lots = MathMax(minLot, MathMin(maxLot, lots));
