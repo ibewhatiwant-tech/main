@@ -14,7 +14,7 @@
 // --- Risk ---
 input double InpMaxDailyLossPct        = 3.0;     // Max daily loss (% of balance)
 input double InpMaxTotalDrawdownPct    = 12.0;    // Max total drawdown (% of balance)
-input double InpHardEquityStopPct      = 15.0;    // Hard equity stop (% of balance)
+input double InpHardEquityStopPct      = 10.0;    // Hard equity stop (% of balance) - must be <= InpMaxTotalDrawdownPct (§23)
 input double InpMaxBasketLossMoney     = 400.0;   // Max basket floating loss (account ccy)
 input double InpMaxFloatingLossPct     = 8.0;     // Max floating loss (% of equity)
 input double InpMaxExposureLots        = 3.0;     // Max lots (this symbol+magic)
