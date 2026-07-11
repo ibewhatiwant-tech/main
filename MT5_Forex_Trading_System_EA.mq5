@@ -1638,7 +1638,11 @@ bool ExecuteIntent(const TradeIntent &intentIn, ENUM_RISK_STATE rs)
    if(!isReduce && g_pending_intent_active) return false;
    if(isReduce && g_pending_close_lock) return false;
 
-   intent.volume = NormalizeVolume(intent.volume);
+   // Reduce/close intents must preserve the exact target position volume - a netted
+   // position can exceed SYMBOL_VOLUME_MAX even though no single fill did, and clamping
+   // it here would silently leave residual exposure after a "successful" flatten/reduce.
+   if(!isReduce)
+      intent.volume = NormalizeVolume(intent.volume);
 
    ENUM_BROKER_GATE_RESULT bg = RunBrokerGate(intent);
    LogBroker(bg, intent);
@@ -1900,6 +1904,44 @@ bool CheckUnwindProof(double &winningProfit, double &losingFloat, double &buffer
    return proven;
   }
 
+// Closes a single position ticket completely, reissuing close requests for any
+// residual volume (partial fill, or a broker-side per-deal cap on a netted position
+// larger than SYMBOL_VOLUME_MAX) instead of treating one order as done.
+void CloseTicketFully(ulong ticket, string reason, ENUM_INTENT_TYPE intentType, string commentPrefix)
+  {
+   const int maxAttempts = 5;
+   for(int attempt=0; attempt<maxAttempts; attempt++)
+     {
+      if(!PositionSelectByTicket(ticket)) return; // fully closed
+      double remaining = PositionGetDouble(POSITION_VOLUME);
+      if(remaining <= 0) return;
+
+      TradeIntent ti; ZeroMemory(ti);
+      ti.intent_type = intentType;
+      ti.magic = InpMagicNumber;
+      ti.deviation = InpMaxSlippagePoints;
+      ti.target_ticket = ticket;
+      ti.volume = remaining;
+      ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      ti.direction = (ptype==POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      ti.comment = commentPrefix+reason;
+      ti.reason = reason;
+      ti.valid = true;
+      g_intent = ti;
+      ExecuteIntent(ti, g_risk.risk_state);
+
+      if(!PositionSelectByTicket(ticket)) return; // fully closed
+      if(PositionGetDouble(POSITION_VOLUME) >= remaining - 1e-8)
+        {
+         // no progress made this attempt - stop retrying in this cycle, log and let
+         // the next tick's flatten/reduce pass pick it up instead of spinning here
+         LogError("CloseTicketFully", 0, "no progress closing ticket="+IntegerToString((long)ticket)+" remaining="+DoubleToString(remaining,2));
+         return;
+        }
+     }
+   LogError("CloseTicketFully", 0, "ticket="+IntegerToString((long)ticket)+" not fully closed after "+IntegerToString(maxAttempts)+" attempts");
+  }
+
 void ExecuteUnwindOrFlatten(string reason)
   {
    for(int i=PositionsTotal()-1;i>=0;i--)
@@ -1910,19 +1952,7 @@ void ExecuteUnwindOrFlatten(string reason)
       if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
       if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber) continue;
 
-      TradeIntent ti; ZeroMemory(ti);
-      ti.intent_type = INTENT_FLATTEN;
-      ti.magic = InpMagicNumber;
-      ti.deviation = InpMaxSlippagePoints;
-      ti.target_ticket = ticket;
-      ti.volume = PositionGetDouble(POSITION_VOLUME);
-      ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      ti.direction = (ptype==POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-      ti.comment = "EA|CLOSE|"+reason;
-      ti.reason = reason;
-      ti.valid = true;
-      g_intent = ti;
-      ExecuteIntent(ti, g_risk.risk_state);
+      CloseTicketFully(ticket, reason, INTENT_FLATTEN, "EA|CLOSE|");
      }
   }
 
@@ -1943,19 +1973,7 @@ void ExecutePartialReduce(string reason)
    if(oldestTicket==0) return;
    if(!PositionSelectByTicket(oldestTicket)) return;
 
-   TradeIntent ti; ZeroMemory(ti);
-   ti.intent_type = INTENT_PARTIAL_CLOSE;
-   ti.magic = InpMagicNumber;
-   ti.deviation = InpMaxSlippagePoints;
-   ti.target_ticket = oldestTicket;
-   ti.volume = PositionGetDouble(POSITION_VOLUME);
-   ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-   ti.direction = (ptype==POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-   ti.comment = "EA|REDUCE|"+reason;
-   ti.reason = reason;
-   ti.valid = true;
-   g_intent = ti;
-   ExecuteIntent(ti, g_risk.risk_state);
+   CloseTicketFully(oldestTicket, reason, INTENT_PARTIAL_CLOSE, "EA|REDUCE|");
   }
 
 //====================================================================
@@ -2275,6 +2293,20 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
      }
   }
 
+// Flattens the basket and only latches g_halt once it is confirmed empty. Latching
+// unconditionally would let a failed/partial close (requote, market closed, invalid
+// volume) get trapped behind the g_halt guard at the top of OnTick with no further
+// retry - leaving a hard-stop or kill-switch breach exposed indefinitely.
+void FlattenThenHaltIfEmpty(string reason)
+  {
+   ExecuteUnwindOrFlatten(reason);
+   SyncExposureLedger();
+   if(!g_basket.has_positions)
+      g_halt = true;
+   else
+      LogError(reason, 0, "flatten incomplete, positions remain - will retry next tick");
+  }
+
 //====================================================================
 // SECTION 22c: MAIN CONTROL LOOP (spec §12)
 //====================================================================
@@ -2285,8 +2317,7 @@ void OnTick()
      {
       g_kill_switch_latched = true;
       SetState(ST_FLATTEN, "manual kill switch");
-      ExecuteUnwindOrFlatten("manual_kill_switch");
-      g_halt = true;
+      FlattenThenHaltIfEmpty("manual_kill_switch");
       LogError("ManualKillSwitch", 0, "OPERATOR_FORCED_HALT");
       SaveState();
       return;
@@ -2344,9 +2375,8 @@ void OnTick()
    if(g_risk.risk_state==RISK_HARD_STOP)
      {
       SetState(ST_FLATTEN, g_risk.block_reason);
-      ExecuteUnwindOrFlatten("hard_stop");
-      g_halt = true;
-      SendAlert("RISK_HARD_STOP", g_risk.block_reason);
+      FlattenThenHaltIfEmpty("hard_stop");
+      SendAlert("RISK_HARD_STOP", g_risk.block_reason+(g_halt?" - basket flattened":" - flatten incomplete, retrying"));
       SaveState();
       return;
      }
