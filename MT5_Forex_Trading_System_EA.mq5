@@ -470,15 +470,9 @@ void ResetDailyPLIfNewDay()
      }
   }
 
-double MoneyToAccountCurrency(double moneyInSymbolProfitCcy)
-  {
-   if(!g_ccy.conversion_valid) return moneyInSymbolProfitCcy; // caller must gate on conversion_valid separately
-   return moneyInSymbolProfitCcy * g_ccy.conversion_rate;
-  }
-
 bool IsFridayFlatWindow()
   {
-   MqlDateTime dt; TimeToStruct(TimeCurrent()+g_btime.gmt_offset_hours*3600, dt);
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt); // TimeCurrent() is already broker server time
    if(dt.day_of_week==5 && dt.hour>=InpFridayFlatHour) return true;
    if(dt.day_of_week==6) return true; // Saturday - market closed for FX/CFD typically
    return false;
@@ -531,11 +525,12 @@ void LogRisk(const RiskDecision &rd)
    double margin = AccountInfoDouble(ACCOUNT_MARGIN);
    double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
    double marginLevel = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   double accountFloatingPL = AccountInfoDouble(ACCOUNT_PROFIT);
    double ddPct = balance>0 ? (balance-equity)/balance*100.0 : 0.0;
    if(isNew) FileWrite(h,"timestamp","symbol","equity","balance","margin","free_margin","margin_level","daily_realized_pl","floating_pl","basket_pl","drawdown_pct","exposure_lots","risk_state","allow_entry","allow_recovery","allow_reduce","block_reason","force_action");
    FileWrite(h, TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), _Symbol, DoubleToString(equity,2), DoubleToString(balance,2),
              DoubleToString(margin,2), DoubleToString(freeMargin,2), DoubleToString(marginLevel,2), DoubleToString(g_daily_realized_pl,2),
-             DoubleToString(g_basket.floating_pl,2), DoubleToString(g_basket.floating_pl,2), DoubleToString(ddPct,2),
+             DoubleToString(accountFloatingPL,2), DoubleToString(g_basket.floating_pl,2), DoubleToString(ddPct,2),
              DoubleToString(g_exposure.gross_lots,2), EnumToString(rd.risk_state), rd.allow_entry?"1":"0", rd.allow_recovery?"1":"0",
              rd.allow_partial_close?"1":"0", rd.block_reason, StateName(rd.force_action));
    FileClose(h);
@@ -680,7 +675,7 @@ void SendAlert(string eventKey, string details)
      {
       string headers = "Content-Type: application/json\r\n";
       string body = StringFormat("{\"event\":\"%s\",\"symbol\":\"%s\",\"details\":\"%s\"}", eventKey, _Symbol, details);
-      char post[]; char result[]; string resultHeaders;
+      uchar post[]; uchar result[]; string resultHeaders;
       StringToCharArray(body, post, 0, StringLen(body));
       ResetLastError();
       int rc = WebRequest("POST", InpWebhookURL, headers, 3000, post, result, resultHeaders);
@@ -920,6 +915,20 @@ bool UpdateRegimeSnapshot(RegimeSnapshot &r)
    return true;
   }
 
+// §23 grid-step-vs-broker-constraint check against live ATR, throttled to once per bar.
+datetime g_last_grid_step_check_bar = 0;
+void CheckGridStepVsBrokerConstraint()
+  {
+   datetime barTime = iTime(_Symbol, PERIOD_M5, 0);
+   if(barTime==g_last_grid_step_check_bar) return;
+   g_last_grid_step_check_bar = barTime;
+
+   double gridStepPoints = InpGridStepATRMultiplier*g_regime.atr/g_snap.point;
+   double constraintPoints = g_snap.stops_level_points+g_snap.freeze_level_points;
+   if(gridStepPoints <= constraintPoints)
+      LogError("GridStepVsBrokerConstraint", 0, "grid step ("+DoubleToString(gridStepPoints,1)+"pts) too tight against stops+freeze level ("+DoubleToString(constraintPoints,1)+"pts)");
+  }
+
 //====================================================================
 // SECTION 18b: SESSION TIME INTEGRITY (§18)
 //====================================================================
@@ -942,10 +951,6 @@ void RecomputeBrokerTimeOffset()
 //====================================================================
 ENUM_SESSION_MODE ComputeSessionMode()
   {
-   if(!g_snap.session_trade_allowed || !SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE))
-     {
-      // still allow reduce-only path even if entry disabled, evaluated below via broker flags
-     }
    bool terminalOk = TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && TerminalInfoInteger(TERMINAL_CONNECTED);
    bool accountOk  = AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)!=0;
 
@@ -955,7 +960,7 @@ ENUM_SESSION_MODE ComputeSessionMode()
    if(!terminalOk || !accountOk)
       return SESSION_CLOSED;
 
-   MqlDateTime dt; TimeToStruct(TimeCurrent()+g_btime.gmt_offset_hours*3600, dt);
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt); // TimeCurrent() is already broker server time
    int hour = dt.hour;
 
    if(hour>=InpReduceOnlyStartHour)
@@ -1565,6 +1570,45 @@ void BuildRequestFromIntent(const TradeIntent &intent, MqlTradeRequest &req)
      }
   }
 
+// Single bounded attempt to re-attach SL/TP to a position that was sent naked
+// after TRADE_RETCODE_INVALID_STOPS. If freeze level still blocks it, the
+// failure is logged so the unprotected position is visible for reconciliation.
+void AttemptSltpFollowup(ulong positionTicket, double sl, double tp)
+  {
+   if(!PositionSelectByTicket(positionTicket)) return;
+
+   TradeIntent mti; ZeroMemory(mti);
+   mti.intent_type = INTENT_MODIFY;
+   mti.target_ticket = positionTicket;
+   mti.sl = NormalizePriceValue(sl);
+   mti.tp = NormalizePriceValue(tp);
+   mti.magic = InpMagicNumber;
+
+   ENUM_BROKER_GATE_RESULT bg = RunBrokerGate(mti);
+   LogBroker(bg, mti);
+   if(bg != BROKER_PASS)
+     {
+      LogError("SltpFollowup", 0, "blocked by broker gate: "+EnumToString(bg)+" ticket="+IntegerToString((long)positionTicket));
+      return;
+     }
+
+   MqlTradeRequest req; BuildRequestFromIntent(mti, req);
+   MqlTradeCheckResult chk; ZeroMemory(chk);
+   bool checkOk = OrderCheck(req, chk);
+   LogOrderCheck(req, chk, checkOk, RISK_NORMAL, bg);
+   if(!checkOk)
+     {
+      LogError("SltpFollowup", GetLastError(), "ORDERCHECK_FAIL retcode="+IntegerToString((int)chk.retcode));
+      return;
+     }
+
+   MqlTradeResult res; ZeroMemory(res);
+   ResetLastError();
+   bool ok = OrderSend(req, res);
+   LogExecution(req, res, ok, GetLastError(), 0, 0, ok?"SLTP_REATTACHED":"SLTP_REATTACH_FAILED");
+   if(!ok) LogError("SltpFollowup", GetLastError(), "position left without SL/TP, ticket="+IntegerToString((long)positionTicket));
+  }
+
 // Returns true if order eventually succeeded (fully or partially), false otherwise.
 bool ExecuteIntent(const TradeIntent &intentIn, ENUM_RISK_STATE rs)
   {
@@ -1611,6 +1655,7 @@ bool ExecuteIntent(const TradeIntent &intentIn, ENUM_RISK_STATE rs)
    MqlTradeRequest req;
    BuildRequestFromIntent(intent, req);
 
+   SetState(ST_ORDERCHECK, "preflight validation for "+EnumToString(intent.intent_type));
    MqlTradeCheckResult chk; ZeroMemory(chk);
    bool checkOk = OrderCheck(req, chk);
    LogOrderCheck(req, chk, checkOk, rs, bg);
@@ -1622,8 +1667,11 @@ bool ExecuteIntent(const TradeIntent &intentIn, ENUM_RISK_STATE rs)
       return false;
      }
 
+   SetState(ST_ORDERSEND, "sending "+EnumToString(intent.intent_type));
    int retries=0;
    bool sendOk=false;
+   bool sentNaked=false;
+   double origSl = req.sl, origTp = req.tp;
    MqlTradeResult res; ZeroMemory(res);
    uint startTick = GetTickCount();
    while(retries <= InpMaxOrderRetries)
@@ -1651,6 +1699,8 @@ bool ExecuteIntent(const TradeIntent &intentIn, ENUM_RISK_STATE rs)
                          res.retcode==TRADE_RETCODE_PRICE_OFF || res.retcode==TRADE_RETCODE_TIMEOUT ||
                          res.retcode==TRADE_RETCODE_CONNECTION);
       LogExecution(req, res, sendOk, lastErr, latency, retries, retryable?"RETRY":"FAIL");
+      if(res.retcode==TRADE_RETCODE_TIMEOUT || res.retcode==TRADE_RETCODE_CONNECTION)
+         SetState(ST_ORDER_PENDING, "uncertain execution state, will resync from broker");
 
       if(res.retcode==TRADE_RETCODE_INVALID_VOLUME)
         {
@@ -1658,7 +1708,7 @@ bool ExecuteIntent(const TradeIntent &intentIn, ENUM_RISK_STATE rs)
         }
       else if(res.retcode==TRADE_RETCODE_INVALID_STOPS)
         {
-         req.sl = 0; req.tp = 0; // send naked, modify later
+         req.sl = 0; req.tp = 0; sentNaked = true; // send naked, modify immediately after fill
         }
       else if(res.retcode==TRADE_RETCODE_NO_MONEY)
         {
@@ -1696,10 +1746,17 @@ bool ExecuteIntent(const TradeIntent &intentIn, ENUM_RISK_STATE rs)
       g_recovery.depth++;
       g_recovery.last_recovery_time = TimeCurrent();
       g_recovery.last_recovery_price = req.price;
+      if(intent.intent_type==INTENT_HEDGE) g_recovery.hedge_lots += res.volume;
       LogRecovery(intent.intent_type==INTENT_GRID?"GRID_OPENED":"HEDGE_OPENED", g_recovery, req.volume);
      }
 
    LogTransaction(EnumToString(intent.intent_type), res.order, res.volume, res.price, 0);
+
+   // Stops were stripped to get past an INVALID_STOPS rejection; re-attach them now
+   // that the position exists, instead of leaving it permanently unprotected.
+   if(sentNaked && (origSl>0 || origTp>0) && res.order>0)
+      AttemptSltpFollowup(res.order, origSl, origTp);
+
    return true;
   }
 
@@ -1780,10 +1837,12 @@ void RunRecoveryFSM()
       double baseVol = InpBaseLot * MathPow(InpRecoveryLotMultiplier, g_recovery.depth);
       baseVol = MathMin(baseVol, InpMaxRecoveryLots);
       double roomLeft = InpMaxExposureLots - g_exposure.gross_lots;
-      if(roomLeft <= 0) { g_recovery.mode = RECOVERY_REDUCE_ONLY; return; }
+      if(roomLeft < g_snap.volume_min - 1e-8) { g_recovery.mode = RECOVERY_REDUCE_ONLY; return; }
       baseVol = MathMin(baseVol, roomLeft);
       baseVol = NormalizeVolume(baseVol);
-      if(baseVol < g_snap.volume_min) return;
+      // NormalizeVolume() rounds to the nearest step and can round baseVol
+      // back above roomLeft when roomLeft sits between steps; never breach the cap.
+      if(baseVol < g_snap.volume_min - 1e-8 || baseVol > roomLeft + 1e-8) { g_recovery.mode = RECOVERY_REDUCE_ONLY; return; }
 
       TradeIntent ti; ZeroMemory(ti);
       ti.magic = InpMagicNumber;
@@ -1915,7 +1974,7 @@ void CheckWeekendGapEscalation()
          SendAlert("WEEKEND_FLATTEN_FAILURE", "positions still open "+IntegerToString(elapsedMin)+"min after flatten trigger");
          ExecuteUnwindOrFlatten("weekend_escalated_flatten");
         }
-      MqlDateTime dt; TimeToStruct(TimeCurrent()+g_btime.gmt_offset_hours*3600, dt);
+      MqlDateTime dt; TimeToStruct(TimeCurrent(), dt); // TimeCurrent() is already broker server time
       if(dt.day_of_week==5 && dt.hour>=23 && !g_weekend_gap_logged)
         {
          g_weekend_gap_logged = true;
@@ -1979,7 +2038,7 @@ bool LoadState()
 // Rebuild recovery depth from broker positions when state file missing/corrupted.
 void RebuildStateFromBroker()
   {
-   int depth=0;
+   int depth=0; int hedgeCount=0; double hedgeLots=0;
    for(int i=PositionsTotal()-1;i>=0;i--)
      {
       ulong ticket = PositionGetTicket(i);
@@ -1989,9 +2048,11 @@ void RebuildStateFromBroker()
       if((long)PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber) continue;
       string cmt = PositionGetString(POSITION_COMMENT);
       if(StringFind(cmt,"GRID")>=0 || StringFind(cmt,"HEDGE")>=0) depth++;
+      if(StringFind(cmt,"HEDGE")>=0) { hedgeCount++; hedgeLots += PositionGetDouble(POSITION_VOLUME); }
      }
    g_recovery.depth = depth;
-   if(depth>0) g_recovery.mode = RECOVERY_GRID;
+   g_recovery.hedge_lots = hedgeLots;
+   if(depth>0) g_recovery.mode = (hedgeCount>0) ? RECOVERY_HEDGE : RECOVERY_GRID;
    if(g_basket_id_counter==0) g_basket_id_counter = (long)TimeCurrent();
   }
 
@@ -2069,8 +2130,9 @@ bool ValidateInputsCrossCheck()
    double neededRecoveryLot = InpBaseLot*InpRecoveryLotMultiplier;
    if(!(InpMaxRecoveryLots >= neededRecoveryLot)) { allOk=false; failures += "RecoveryLotVsMaxRecoveryLot;"; }
 
-   // Grid step vs broker constraint: cannot be statically verified without a symbol-select yet;
-   // performed again at runtime per bar via CheckGridStepVsBrokerConstraint().
+   // Grid step vs broker constraint: cannot be statically verified without a live
+   // ATR reading yet, so this uses a conservative floor at OnInit; CheckGridStepVsBrokerConstraint()
+   // re-runs the real check against live ATR once per bar from OnTick.
    if(g_snap.valid)
      {
       double minExpectedATR = g_snap.point*10.0; // conservative floor, refined at runtime
@@ -2265,6 +2327,7 @@ void OnTick()
       return;
      }
    LogRegime(g_regime);
+   CheckGridStepVsBrokerConstraint();
 
    // §19 currency refresh (periodic, cheap to call - internally rate-limited by tick check via last_refresh)
    if(!InpAssumeUSDOnlyAccount && (TimeCurrent()-g_ccy.last_refresh > 60 || !g_ccy.conversion_valid))
@@ -2302,10 +2365,12 @@ void OnTick()
       SetState(ST_IN_POSITION, "basket active");
 
       // §16 unwind proof check first — do not close hedge/recovery blindly
+      SetState(ST_UNWIND_CHECK, "testing unwind offset proof");
       double winP, loseP, buf;
       bool proven = CheckUnwindProof(winP, loseP, buf);
       if(proven && g_risk.allow_partial_close && g_basket.floating_pl > -InpMaxBasketLossMoney)
         {
+         g_recovery.mode = RECOVERY_UNWIND;
          SetState(ST_UNWIND, "unwind proof satisfied");
          ExecuteUnwindOrFlatten("unwind_proof_satisfied");
         }
