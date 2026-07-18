@@ -108,7 +108,14 @@ jobs:
             if (Test-Path $logFile) { Remove-Item $logFile }
 
             Write-Host "::group::Compiling $($source.Name)"
-            & "$env:METAEDITOR" "/compile:$($source.FullName)" "/inc:$env:MQL_INCLUDE" "/log:$logFile" '/portable'
+            # MetaEditor's own argument parser needs literal embedded quotes around
+            # path values (matching its documented /switch:"path" form) - shell-level
+            # quoting alone isn't enough once a path contains spaces, e.g.
+            # "C:\Program Files\...", which otherwise gets truncated at the first space.
+            $compileArg = "/compile:`"$($source.FullName)`""
+            $incArg = "/inc:`"$env:MQL_INCLUDE`""
+            $logArg = "/log:`"$logFile`""
+            & "$env:METAEDITOR" $compileArg $incArg $logArg '/portable'
 
             $deadline = (Get-Date).AddSeconds(90)
             while (-not (Test-Path $ex5) -and -not (Test-Path $logFile) -and (Get-Date) -lt $deadline) {
