@@ -108,14 +108,15 @@ jobs:
             if (Test-Path $logFile) { Remove-Item $logFile }
 
             Write-Host "::group::Compiling $($source.Name)"
-            # MetaEditor's own argument parser needs literal embedded quotes around
-            # path values (matching its documented /switch:"path" form) - shell-level
-            # quoting alone isn't enough once a path contains spaces, e.g.
-            # "C:\Program Files\...", which otherwise gets truncated at the first space.
-            $compileArg = "/compile:`"$($source.FullName)`""
-            $incArg = "/inc:`"$env:MQL_INCLUDE`""
-            $logArg = "/log:`"$logFile`""
-            & "$env:METAEDITOR" $compileArg $incArg $logArg '/portable'
+            # MetaEditor's own argument parser needs literal embedded quotes around path
+            # values (its documented /switch:"path" form). Passing quoted strings through
+            # the `&` call operator as separate array elements makes PowerShell/.NET
+            # re-escape those embedded quotes for the Win32 command line (" becomes \"),
+            # which MetaEditor's parser doesn't understand - it truncated the path at the
+            # first space instead. Start-Process with a single pre-built argument string
+            # bypasses that per-element re-escaping and sends the literal text through.
+            $arguments = "/compile:`"$($source.FullName)`" /inc:`"$env:MQL_INCLUDE`" /log:`"$logFile`" /portable"
+            Start-Process -FilePath $env:METAEDITOR -ArgumentList $arguments -Wait -NoNewWindow
 
             $deadline = (Get-Date).AddSeconds(90)
             while (-not (Test-Path $ex5) -and -not (Test-Path $logFile) -and (Get-Date) -lt $deadline) {
