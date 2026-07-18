@@ -1,0 +1,150 @@
+name: Compile MQL5
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*.mq5'
+      - '**/*.mqh'
+      - '.github/workflows/mql5-compile.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**/*.mq5'
+      - '**/*.mqh'
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: MQL5 Compile Check
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install MetaTrader 5 terminal (provides MetaEditor compiler)
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'mt5setup.exe'
+          Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe' -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList '/auto' -Wait
+
+          $searchRoots = @(
+            $env:ProgramFiles,
+            ${env:ProgramFiles(x86)},
+            (Join-Path $env:APPDATA 'MetaQuotes'),
+            (Join-Path $env:LOCALAPPDATA 'Programs')
+          ) | Where-Object { $_ -and (Test-Path $_) }
+
+          $metaeditor = Get-ChildItem -Path $searchRoots -Recurse -Filter 'metaeditor64.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $metaeditor) {
+            throw 'metaeditor64.exe not found after MetaTrader 5 installation.'
+          }
+          echo "METAEDITOR=$($metaeditor.FullName)" >> $env:GITHUB_ENV
+
+          # The base installer only lays down the terminal/editor binaries - the actual
+          # MQL5\Include Standard Library tree is unpacked by terminal64.exe on its first
+          # run. Launch it once in portable mode (so its data folder lands beside the
+          # binaries, inside our known search roots) to provision it, then close it.
+          $terminalExe = Join-Path $metaeditor.DirectoryName 'terminal64.exe'
+          if (Test-Path $terminalExe) {
+            Start-Process -FilePath $terminalExe -ArgumentList '/portable'
+            Start-Sleep -Seconds 20
+            Get-Process -Name 'terminal64', 'terminal' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+          }
+
+          # MetaEditor resolves an angle-bracket include as "<inc-path>\Include\<file>",
+          # so /inc must be the folder that CONTAINS "Include", not the Include folder
+          # itself. Rather than guess the install layout, locate Trade.mqh (a Standard
+          # Library file we know we need) and derive the /inc root from its real path.
+          $tradeMqh = $null
+          $deadline = (Get-Date).AddSeconds(60)
+          while (-not $tradeMqh -and (Get-Date) -lt $deadline) {
+            $tradeMqh = Get-ChildItem -Path $searchRoots -Recurse -Filter 'Trade.mqh' -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\Include\\Trade\\Trade\.mqh$' } |
+              Select-Object -First 1
+            if (-not $tradeMqh) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $tradeMqh) {
+            throw 'Trade.mqh not found under any MetaTrader install location - cannot determine the Standard Library /inc root.'
+          }
+          $mqlRoot = $tradeMqh.FullName -replace '\\Include\\Trade\\Trade\.mqh$', ''
+          echo "MQL_INCLUDE=$mqlRoot" >> $env:GITHUB_ENV
+
+      - name: Compile MQL5 sources
+        shell: pwsh
+        run: |
+          # MetaEditor's own process exit code is not a reliable success signal (it can
+          # return 0 on failed compiles); the compiler only ever writes a .ex5 when the
+          # file is truly free of errors, so that is the pass/fail check used below.
+          #
+          # If a terminal/editor instance is already running (e.g. auto-launched by the
+          # installer), a new metaeditor64.exe invocation just forwards the command to it
+          # over IPC and returns almost instantly without compiling in this process. Kill
+          # any leftover instances first, and poll for the output instead of assuming the
+          # process is done compiling the moment it returns.
+          Get-Process -Name 'terminal64', 'terminal', 'metaeditor64', 'metaeditor' -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+          $logDir = Join-Path $env:GITHUB_WORKSPACE 'compile-logs'
+          New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+
+          $sources = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'EAs') -Filter '*.mq5' -Recurse
+          if ($sources.Count -eq 0) {
+            throw 'No .mq5 files found under EAs/.'
+          }
+
+          $failed = $false
+          foreach ($source in $sources) {
+            $ex5 = [System.IO.Path]::ChangeExtension($source.FullName, 'ex5')
+            if (Test-Path $ex5) { Remove-Item $ex5 }
+
+            $logFile = Join-Path $logDir "$($source.BaseName).log"
+            if (Test-Path $logFile) { Remove-Item $logFile }
+
+            Write-Host "::group::Compiling $($source.Name)"
+            # MetaEditor's own argument parser needs literal embedded quotes around path
+            # values (its documented /switch:"path" form). Passing quoted strings through
+            # the `&` call operator as separate array elements makes PowerShell/.NET
+            # re-escape those embedded quotes for the Win32 command line (" becomes \"),
+            # which MetaEditor's parser doesn't understand - it truncated the path at the
+            # first space instead. Start-Process with a single pre-built argument string
+            # bypasses that per-element re-escaping and sends the literal text through.
+            $arguments = "/compile:`"$($source.FullName)`" /inc:`"$env:MQL_INCLUDE`" /log:`"$logFile`" /portable"
+            Start-Process -FilePath $env:METAEDITOR -ArgumentList $arguments -Wait -NoNewWindow
+
+            $deadline = (Get-Date).AddSeconds(90)
+            while (-not (Test-Path $ex5) -and -not (Test-Path $logFile) -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 2
+            }
+
+            if (Test-Path $logFile) {
+              Get-Content -Path $logFile -Encoding Unicode | Write-Host
+            } else {
+              Write-Host "(no log file produced)"
+            }
+            Write-Host "::endgroup::"
+
+            if (-not (Test-Path $ex5)) {
+              Write-Host "::error::Compilation failed for $($source.Name) - no .ex5 output produced."
+              $failed = $true
+            }
+          }
+
+          if ($failed) {
+            throw 'One or more MQL5 files failed to compile. See the logs above and the uploaded artifact.'
+          }
+
+      - name: Upload compiler logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mql5-compile-log
+          path: compile-logs/*.log
+          if-no-files-found: warn
+          retention-days: 14
