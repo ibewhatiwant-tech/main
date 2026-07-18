@@ -1,0 +1,56 @@
+name: Compile MQL5
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*.mq5'
+      - '**/*.mqh'
+      - '.github/workflows/mql5-compile.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**/*.mq5'
+      - '**/*.mqh'
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: MQL5 Compile Check
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Compile MQL5 sources
+        uses: fx31337/mql-compile-action@v2.0.0
+        with:
+          # Change this to your actual EA file or folder.
+          path: 'EAs'
+
+          # Required so #include files in the repo can be found.
+          include: '.'
+
+          # Compile output retained as an artifact for diagnosis.
+          log-file: 'mql5-compile.log'
+
+          # Treat warnings as failures initially for stricter quality control.
+          ignore-warnings: false
+
+          # Needed if your EA uses standard MT5 includes,
+          # e.g. #include <Trade/Trade.mqh>.
+          init-platform: true
+
+          verbose: true
+
+      - name: Upload compiler log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mql5-compile-log
+          path: mql5-compile.log
+          if-no-files-found: warn
+          retention-days: 14
