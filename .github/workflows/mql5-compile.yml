@@ -43,40 +43,53 @@ jobs:
           if (-not $metaeditor) {
             throw 'metaeditor64.exe not found after MetaTrader 5 installation.'
           }
-          # mql-compile-action globs mt-path with the npm 'glob' package, which requires
-          # forward slashes for '**' patterns; path.join's backslashes make it match nothing.
-          $mt5Path = $metaeditor.DirectoryName -replace '\\', '/'
-          echo "MT5_PATH=$mt5Path" >> $env:GITHUB_ENV
+          echo "METAEDITOR=$($metaeditor.FullName)" >> $env:GITHUB_ENV
 
       - name: Compile MQL5 sources
-        uses: fx31337/mql-compile-action@v2.0.0
-        with:
-          # Change this to your actual EA file or folder.
-          path: 'EAs'
+        shell: pwsh
+        run: |
+          # MetaEditor's own process exit code is not a reliable success signal (it can
+          # return 0 on failed compiles); the compiler only ever writes a .ex5 when the
+          # file is truly free of errors, so that is the pass/fail check used below.
+          $logDir = Join-Path $env:GITHUB_WORKSPACE 'compile-logs'
+          New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
-          # Required so #include files in the repo can be found.
-          include: '.'
+          $sources = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'EAs') -Filter '*.mq5' -Recurse
+          if ($sources.Count -eq 0) {
+            throw 'No .mq5 files found under EAs/.'
+          }
 
-          # Compile output retained as an artifact for diagnosis.
-          log-file: 'mql5-compile.log'
+          $failed = $false
+          foreach ($source in $sources) {
+            $ex5 = [System.IO.Path]::ChangeExtension($source.FullName, 'ex5')
+            if (Test-Path $ex5) { Remove-Item $ex5 }
 
-          # Treat warnings as failures initially for stricter quality control.
-          ignore-warnings: false
+            $logFile = Join-Path $logDir "$($source.BaseName).log"
+            Write-Host "::group::Compiling $($source.Name)"
+            & "$env:METAEDITOR" "/compile:$($source.FullName)" "/inc:$env:GITHUB_WORKSPACE" "/log:$logFile"
 
-          # Points at the MetaEditor install located in the previous step.
-          mt-path: ${{ env.MT5_PATH }}
+            if (Test-Path $logFile) {
+              Get-Content -Path $logFile -Encoding Unicode | Write-Host
+            } else {
+              Write-Host "(no log file produced)"
+            }
+            Write-Host "::endgroup::"
 
-          # Needed if your EA uses standard MT5 includes,
-          # e.g. #include <Trade/Trade.mqh>.
-          init-platform: true
+            if (-not (Test-Path $ex5)) {
+              Write-Host "::error::Compilation failed for $($source.Name) - no .ex5 output produced."
+              $failed = $true
+            }
+          }
 
-          verbose: true
+          if ($failed) {
+            throw 'One or more MQL5 files failed to compile. See the logs above and the uploaded artifact.'
+          }
 
-      - name: Upload compiler log
+      - name: Upload compiler logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mql5-compile-log
-          path: mql5-compile.log
+          path: compile-logs/*.log
           if-no-files-found: warn
           retention-days: 14
