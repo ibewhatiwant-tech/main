@@ -45,12 +45,18 @@ jobs:
           }
           echo "METAEDITOR=$($metaeditor.FullName)" >> $env:GITHUB_ENV
 
-          # Standard Library (<Trade/Trade.mqh> etc.) ships next to MetaEditor itself.
-          $mqlInclude = Join-Path $metaeditor.DirectoryName 'MQL5\Include'
-          if (-not (Test-Path $mqlInclude)) {
-            throw "Standard Library include folder not found at '$mqlInclude'."
+          # MetaEditor resolves an angle-bracket include as "<inc-path>\Include\<file>",
+          # so /inc must be the folder that CONTAINS "Include", not the Include folder
+          # itself. Rather than guess the install layout, locate Trade.mqh (a Standard
+          # Library file we know we need) and derive the /inc root from its real path.
+          $tradeMqh = Get-ChildItem -Path $searchRoots -Recurse -Filter 'Trade.mqh' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\Include\\Trade\\Trade\.mqh$' } |
+            Select-Object -First 1
+          if (-not $tradeMqh) {
+            throw 'Trade.mqh not found under any MetaTrader install location - cannot determine the Standard Library /inc root.'
           }
-          echo "MQL_INCLUDE=$mqlInclude" >> $env:GITHUB_ENV
+          $mqlRoot = $tradeMqh.FullName -replace '\\Include\\Trade\\Trade\.mqh$', ''
+          echo "MQL_INCLUDE=$mqlRoot" >> $env:GITHUB_ENV
 
       - name: Compile MQL5 sources
         shell: pwsh
