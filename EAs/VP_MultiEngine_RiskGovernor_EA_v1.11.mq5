@@ -568,7 +568,7 @@ void RefreshRiskLedger(SRiskLedger &ledger)
 {
    ledger.balance = AccountInfoDouble(ACCOUNT_BALANCE);
    ledger.equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   ledger.freeMargin = AccountInfoDouble(ACCOUNT_FREEMARGIN);
+   ledger.freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
    ledger.actualOpenRiskMoney = CalculateOpenRiskMoney();
    ledger.reservedRiskMoney = g_reservedRiskMoney;
    ledger.maxOpenRiskMoney = ledger.balance * InpMaxOpenRiskPercent / 100.0;
@@ -865,44 +865,46 @@ void ResetLane(SLane &lane)
    lane.submittedAt = 0;
 }
 
-void ReconcileLanes()
+void ReconcileLane(SLane &lane)
 {
    datetime now = TimeCurrent();
-   for(int i = 0; i < 6; i++)
+   ulong positionId = 0;
+   bool hasPosition = FindPositionForLane(lane.engine, lane.direction, positionId);
+   if(hasPosition)
    {
-      SLane &lane = g_lanes[i];
-      ulong positionId = 0;
-      bool hasPosition = FindPositionForLane(lane.engine, lane.direction, positionId);
-      if(hasPosition)
+      if(lane.state != LANE_OPEN)
       {
-         if(lane.state != LANE_OPEN)
-         {
-            lane.state = LANE_OPEN;
-            ReleaseLaneReservation(lane);
-            lane.orderTicket = 0;
-         }
-         lane.positionIdentifier = positionId;
-         continue;
+         lane.state = LANE_OPEN;
+         ReleaseLaneReservation(lane);
+         lane.orderTicket = 0;
       }
-      if(lane.state == LANE_OPEN)
-      {
-         // Position gone with no matching exit deal seen yet (e.g. missed event after a restart).
-         lane.state = LANE_COOLDOWN;
-         lane.cooldownUntil = now + InpCooldownBars * PeriodSeconds(_Period);
-         lane.positionIdentifier = 0;
-         lane.lastRiskMoney = 0.0;
-      }
-      else if(lane.state == LANE_SUBMITTED)
-      {
-         if(now - lane.submittedAt > InpSubmissionTimeoutSeconds)
-         {
-            Audit("SUBMISSION_TIMEOUT", EngineName(lane.engine), DirectionName(lane.direction),
-                  "No confirmed fill or rejection within timeout");
-            ResetLane(lane);
-         }
-      }
-      if(lane.state == LANE_COOLDOWN && now >= lane.cooldownUntil) lane.state = LANE_IDLE;
+      lane.positionIdentifier = positionId;
+      return;
    }
+   if(lane.state == LANE_OPEN)
+   {
+      // Position gone with no matching exit deal seen yet (e.g. missed event after a restart).
+      lane.state = LANE_COOLDOWN;
+      lane.cooldownUntil = now + InpCooldownBars * PeriodSeconds(_Period);
+      lane.positionIdentifier = 0;
+      lane.lastRiskMoney = 0.0;
+   }
+   else if(lane.state == LANE_SUBMITTED)
+   {
+      if(now - lane.submittedAt > InpSubmissionTimeoutSeconds)
+      {
+         Audit("SUBMISSION_TIMEOUT", EngineName(lane.engine), DirectionName(lane.direction),
+               "No confirmed fill or rejection within timeout");
+         ResetLane(lane);
+      }
+   }
+   if(lane.state == LANE_COOLDOWN && now >= lane.cooldownUntil) lane.state = LANE_IDLE;
+}
+
+void ReconcileLanes()
+{
+   for(int i = 0; i < 6; i++)
+      ReconcileLane(g_lanes[i]);
 }
 
 bool SubmitProposal(STradeProposal &proposal, SLane &lane, SRiskLedger &ledger)
@@ -971,38 +973,43 @@ void SortProposals(STradeProposal &proposals[])
          }
 }
 
+bool TryExecuteProposal(STradeProposal &proposal, SLane &lane, const SMarket &market, SRiskLedger &ledger)
+{
+   if(lane.state != LANE_IDLE)
+   {
+      Audit("PROPOSAL_BLOCKED", EngineName(proposal.engine), DirectionName(proposal.direction), "Lane is not idle");
+      return false;
+   }
+   string reason;
+   if(!RiskGovernorApprove(proposal, market, ledger, reason))
+   {
+      lane.lastReason = reason;
+      Audit("RISK_BLOCK", EngineName(proposal.engine), DirectionName(proposal.direction), reason,
+            proposal.entry, proposal.sl, proposal.tp);
+      return false;
+   }
+   if(SubmitProposal(proposal, lane, ledger))
+   {
+      ledger.openPositions++;
+      return true;
+   }
+   return false;
+}
+
 void ResolveAndExecute(STradeProposal &proposals[], const SMarket &market, SRiskLedger &ledger)
 {
    SortProposals(proposals);
    bool entryTaken = false;
    for(int i = 0; i < ArraySize(proposals); i++)
    {
-      STradeProposal &proposal = proposals[i];
-      if(!proposal.valid) continue;
+      if(!proposals[i].valid) continue;
       if(!InpAllowMultipleEntriesSameBar && entryTaken)
       {
-         Audit("PROPOSAL_BLOCKED", EngineName(proposal.engine), DirectionName(proposal.direction), "Entry already accepted this bar");
+         Audit("PROPOSAL_BLOCKED", EngineName(proposals[i].engine), DirectionName(proposals[i].direction), "Entry already accepted this bar");
          continue;
       }
-      SLane &lane = g_lanes[LaneIndex(proposal.engine, proposal.direction)];
-      if(lane.state != LANE_IDLE)
-      {
-         Audit("PROPOSAL_BLOCKED", EngineName(proposal.engine), DirectionName(proposal.direction), "Lane is not idle");
-         continue;
-      }
-      string reason;
-      if(!RiskGovernorApprove(proposal, market, ledger, reason))
-      {
-         lane.lastReason = reason;
-         Audit("RISK_BLOCK", EngineName(proposal.engine), DirectionName(proposal.direction), reason,
-               proposal.entry, proposal.sl, proposal.tp);
-         continue;
-      }
-      if(SubmitProposal(proposal, lane, ledger))
-      {
+      if(TryExecuteProposal(proposals[i], g_lanes[LaneIndex(proposals[i].engine, proposals[i].direction)], market, ledger))
          entryTaken = true;
-         ledger.openPositions++;
-      }
    }
 }
 
@@ -1086,6 +1093,44 @@ void OnTick()
    ResolveAndExecute(proposals, market, ledger);
 }
 
+void HandleFillConfirmed(SLane &lane, const ulong orderTicket, const ulong dealTicket, const ulong positionId,
+                          const double dealPrice, const double dealVolume, const uint dealReason, const string dealComment)
+{
+   ReleaseLaneReservation(lane);
+   lane.state = LANE_OPEN;
+   lane.positionIdentifier = positionId;
+   lane.orderTicket = 0;
+   Audit("FILL_CONFIRMED", EngineName(lane.engine), DirectionName(lane.direction), "Position opened",
+         lane.requestedEntry, 0.0, 0.0, lane.requestedVolume, lane.lastRiskMoney, dealReason,
+         orderTicket, dealTicket, positionId, dealPrice, dealVolume, dealComment);
+}
+
+void HandleExitConfirmed(SLane &lane, const ulong orderTicket, const ulong dealTicket, const ulong positionId,
+                          const double dealPrice, const double dealVolume, const uint dealReason, const string dealComment,
+                          const double profit, const double commission, const double swap)
+{
+   double netPnL = profit + commission + swap;
+   double rMultiple = lane.lastRiskMoney > 0.0 ? netPnL / lane.lastRiskMoney : 0.0;
+   Audit("EXIT_CONFIRMED", EngineName(lane.engine), DirectionName(lane.direction), "Position exit deal",
+         0.0, 0.0, 0.0, dealVolume, lane.lastRiskMoney, dealReason,
+         orderTicket, dealTicket, positionId, dealPrice, dealVolume, dealComment,
+         commission, swap, netPnL, rMultiple);
+   if(!HasPositionForLane(lane.engine, lane.direction))
+   {
+      lane.state = LANE_COOLDOWN;
+      lane.cooldownUntil = TimeCurrent() + InpCooldownBars * PeriodSeconds(_Period);
+      lane.positionIdentifier = 0;
+      lane.lastRiskMoney = 0.0;
+   }
+}
+
+void HandleTransactionReject(SLane &lane, const string comment, const uint retcode)
+{
+   Audit("TRANSACTION_REJECT", EngineName(lane.engine), DirectionName(lane.direction), comment,
+         0,0,0,0,0, retcode);
+   ResetLane(lane);
+}
+
 void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
 {
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
@@ -1112,37 +1157,18 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
             ENUM_ORDER_TYPE dir = HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
             idx = LaneIndex(eng, dir);
          }
-         SLane &lane = g_lanes[idx];
-         ReleaseLaneReservation(lane);
-         lane.state = LANE_OPEN;
-         lane.positionIdentifier = positionId;
-         lane.orderTicket = 0;
-         Audit("FILL_CONFIRMED", EngineName(lane.engine), DirectionName(lane.direction), "Position opened",
-               lane.requestedEntry, 0.0, 0.0, lane.requestedVolume, lane.lastRiskMoney, dealReason,
-               trans.order, trans.deal, positionId, dealPrice, dealVolume, dealComment);
+         HandleFillConfirmed(g_lanes[idx], trans.order, trans.deal, positionId, dealPrice, dealVolume, dealReason, dealComment);
       }
       else if(entryType == DEAL_ENTRY_OUT || entryType == DEAL_ENTRY_OUT_BY)
       {
          int idx = LaneIndexByPosition(positionId);
          if(idx >= 0)
          {
-            SLane &lane = g_lanes[idx];
             double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
             double commission = HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
             double swap = HistoryDealGetDouble(trans.deal, DEAL_SWAP);
-            double netPnL = profit + commission + swap;
-            double rMultiple = lane.lastRiskMoney > 0.0 ? netPnL / lane.lastRiskMoney : 0.0;
-            Audit("EXIT_CONFIRMED", EngineName(lane.engine), DirectionName(lane.direction), "Position exit deal",
-                  0.0, 0.0, 0.0, dealVolume, lane.lastRiskMoney, dealReason,
-                  trans.order, trans.deal, positionId, dealPrice, dealVolume, dealComment,
-                  commission, swap, netPnL, rMultiple);
-            if(!HasPositionForLane(lane.engine, lane.direction))
-            {
-               lane.state = LANE_COOLDOWN;
-               lane.cooldownUntil = TimeCurrent() + InpCooldownBars * PeriodSeconds(_Period);
-               lane.positionIdentifier = 0;
-               lane.lastRiskMoney = 0.0;
-            }
+            HandleExitConfirmed(g_lanes[idx], trans.order, trans.deal, positionId, dealPrice, dealVolume, dealReason, dealComment,
+                                 profit, commission, swap);
          }
       }
    }
@@ -1153,10 +1179,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
          int idx = LaneIndexByOrderTicket(result.order);
          if(idx >= 0)
          {
-            SLane &lane = g_lanes[idx];
-            Audit("TRANSACTION_REJECT", EngineName(lane.engine), DirectionName(lane.direction), result.comment,
-                  0,0,0,0,0, result.retcode);
-            ResetLane(lane);
+            HandleTransactionReject(g_lanes[idx], result.comment, result.retcode);
          }
          else
          {
