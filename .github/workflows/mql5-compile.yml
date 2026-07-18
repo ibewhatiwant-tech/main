@@ -51,6 +51,16 @@ jobs:
           # MetaEditor's own process exit code is not a reliable success signal (it can
           # return 0 on failed compiles); the compiler only ever writes a .ex5 when the
           # file is truly free of errors, so that is the pass/fail check used below.
+          #
+          # If a terminal/editor instance is already running (e.g. auto-launched by the
+          # installer), a new metaeditor64.exe invocation just forwards the command to it
+          # over IPC and returns almost instantly without compiling in this process. Kill
+          # any leftover instances first, and poll for the output instead of assuming the
+          # process is done compiling the moment it returns.
+          Get-Process -Name 'terminal64', 'terminal', 'metaeditor64', 'metaeditor' -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
           $logDir = Join-Path $env:GITHUB_WORKSPACE 'compile-logs'
           New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
@@ -65,8 +75,15 @@ jobs:
             if (Test-Path $ex5) { Remove-Item $ex5 }
 
             $logFile = Join-Path $logDir "$($source.BaseName).log"
+            if (Test-Path $logFile) { Remove-Item $logFile }
+
             Write-Host "::group::Compiling $($source.Name)"
-            & "$env:METAEDITOR" "/compile:$($source.FullName)" "/inc:$env:GITHUB_WORKSPACE" "/log:$logFile"
+            & "$env:METAEDITOR" "/compile:$($source.FullName)" "/inc:$env:GITHUB_WORKSPACE" "/log:$logFile" '/portable'
+
+            $deadline = (Get-Date).AddSeconds(90)
+            while (-not (Test-Path $ex5) -and -not (Test-Path $logFile) -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 2
+            }
 
             if (Test-Path $logFile) {
               Get-Content -Path $logFile -Encoding Unicode | Write-Host
