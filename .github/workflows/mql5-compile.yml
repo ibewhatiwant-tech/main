@@ -25,6 +25,26 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Install MetaTrader 5 terminal (provides MetaEditor compiler)
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'mt5setup.exe'
+          Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe' -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList '/auto' -Wait
+
+          $searchRoots = @(
+            $env:ProgramFiles,
+            ${env:ProgramFiles(x86)},
+            (Join-Path $env:APPDATA 'MetaQuotes'),
+            (Join-Path $env:LOCALAPPDATA 'Programs')
+          ) | Where-Object { $_ -and (Test-Path $_) }
+
+          $metaeditor = Get-ChildItem -Path $searchRoots -Recurse -Filter 'metaeditor64.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $metaeditor) {
+            throw 'metaeditor64.exe not found after MetaTrader 5 installation.'
+          }
+          echo "MT5_PATH=$($metaeditor.DirectoryName)" >> $env:GITHUB_ENV
+
       - name: Compile MQL5 sources
         uses: fx31337/mql-compile-action@v2.0.0
         with:
@@ -39,6 +59,9 @@ jobs:
 
           # Treat warnings as failures initially for stricter quality control.
           ignore-warnings: false
+
+          # Points at the MetaEditor install located in the previous step.
+          mt-path: ${{ env.MT5_PATH }}
 
           # Needed if your EA uses standard MT5 includes,
           # e.g. #include <Trade/Trade.mqh>.
