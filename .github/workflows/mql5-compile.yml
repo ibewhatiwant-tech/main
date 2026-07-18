@@ -45,13 +45,30 @@ jobs:
           }
           echo "METAEDITOR=$($metaeditor.FullName)" >> $env:GITHUB_ENV
 
+          # The base installer only lays down the terminal/editor binaries - the actual
+          # MQL5\Include Standard Library tree is unpacked by terminal64.exe on its first
+          # run. Launch it once in portable mode (so its data folder lands beside the
+          # binaries, inside our known search roots) to provision it, then close it.
+          $terminalExe = Join-Path $metaeditor.DirectoryName 'terminal64.exe'
+          if (Test-Path $terminalExe) {
+            Start-Process -FilePath $terminalExe -ArgumentList '/portable'
+            Start-Sleep -Seconds 20
+            Get-Process -Name 'terminal64', 'terminal' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+          }
+
           # MetaEditor resolves an angle-bracket include as "<inc-path>\Include\<file>",
           # so /inc must be the folder that CONTAINS "Include", not the Include folder
           # itself. Rather than guess the install layout, locate Trade.mqh (a Standard
           # Library file we know we need) and derive the /inc root from its real path.
-          $tradeMqh = Get-ChildItem -Path $searchRoots -Recurse -Filter 'Trade.mqh' -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '\\Include\\Trade\\Trade\.mqh$' } |
-            Select-Object -First 1
+          $tradeMqh = $null
+          $deadline = (Get-Date).AddSeconds(60)
+          while (-not $tradeMqh -and (Get-Date) -lt $deadline) {
+            $tradeMqh = Get-ChildItem -Path $searchRoots -Recurse -Filter 'Trade.mqh' -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\Include\\Trade\\Trade\.mqh$' } |
+              Select-Object -First 1
+            if (-not $tradeMqh) { Start-Sleep -Seconds 5 }
+          }
           if (-not $tradeMqh) {
             throw 'Trade.mqh not found under any MetaTrader install location - cannot determine the Standard Library /inc root.'
           }
