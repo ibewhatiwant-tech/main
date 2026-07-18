@@ -45,6 +45,13 @@ jobs:
           }
           echo "METAEDITOR=$($metaeditor.FullName)" >> $env:GITHUB_ENV
 
+          # Standard Library (<Trade/Trade.mqh> etc.) ships next to MetaEditor itself.
+          $mqlInclude = Join-Path $metaeditor.DirectoryName 'MQL5\Include'
+          if (-not (Test-Path $mqlInclude)) {
+            throw "Standard Library include folder not found at '$mqlInclude'."
+          }
+          echo "MQL_INCLUDE=$mqlInclude" >> $env:GITHUB_ENV
+
       - name: Compile MQL5 sources
         shell: pwsh
         run: |
@@ -78,7 +85,7 @@ jobs:
             if (Test-Path $logFile) { Remove-Item $logFile }
 
             Write-Host "::group::Compiling $($source.Name)"
-            & "$env:METAEDITOR" "/compile:$($source.FullName)" "/inc:$env:GITHUB_WORKSPACE" "/log:$logFile" '/portable'
+            & "$env:METAEDITOR" "/compile:$($source.FullName)" "/inc:$env:MQL_INCLUDE" "/inc:$env:GITHUB_WORKSPACE" "/log:$logFile" '/portable'
 
             $deadline = (Get-Date).AddSeconds(90)
             while (-not (Test-Path $ex5) -and -not (Test-Path $logFile) -and (Get-Date) -lt $deadline) {
