@@ -108,7 +108,7 @@ jobs:
             if (Test-Path $logFile) { Remove-Item $logFile }
 
             Write-Host "::group::Compiling $($source.Name)"
-            & "$env:METAEDITOR" "/compile:$($source.FullName)" "/inc:$env:MQL_INCLUDE" "/inc:$env:GITHUB_WORKSPACE" "/log:$logFile" '/portable'
+            & "$env:METAEDITOR" "/compile:$($source.FullName)" "/inc:$env:MQL_INCLUDE" "/log:$logFile" '/portable'
 
             $deadline = (Get-Date).AddSeconds(90)
             while (-not (Test-Path $ex5) -and -not (Test-Path $logFile) -and (Get-Date) -lt $deadline) {
