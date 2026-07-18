@@ -43,7 +43,10 @@ jobs:
           if (-not $metaeditor) {
             throw 'metaeditor64.exe not found after MetaTrader 5 installation.'
           }
-          echo "MT5_PATH=$($metaeditor.DirectoryName)" >> $env:GITHUB_ENV
+          # mql-compile-action globs mt-path with the npm 'glob' package, which requires
+          # forward slashes for '**' patterns; path.join's backslashes make it match nothing.
+          $mt5Path = $metaeditor.DirectoryName -replace '\\', '/'
+          echo "MT5_PATH=$mt5Path" >> $env:GITHUB_ENV
 
       - name: Compile MQL5 sources
         uses: fx31337/mql-compile-action@v2.0.0
